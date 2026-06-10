@@ -41,6 +41,13 @@ class SOFollowerConfig:
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = True
 
+    # Proprioceptive register logging (thesis extension).
+    # When enabled, the corresponding STS3215 registers are read alongside
+    # position and included in observation_features for dataset recording.
+    log_current: bool = False
+    log_temperature: bool = False
+    log_voltage: bool = False
+
 
 @RobotConfig.register_subclass("so101_follower")
 @RobotConfig.register_subclass("so100_follower")

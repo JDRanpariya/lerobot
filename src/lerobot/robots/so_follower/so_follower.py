@@ -67,6 +67,18 @@ class SOFollower(Robot):
         return {f"{motor}.pos": float for motor in self.bus.motors}
 
     @property
+    def _proprio_ft(self) -> dict[str, type]:
+        """Proprioceptive register features (thesis extension)."""
+        ft: dict[str, type] = {}
+        if self.config.log_current:
+            ft.update({f"{motor}.cur": float for motor in self.bus.motors})
+        if self.config.log_temperature:
+            ft.update({f"{motor}.temp": float for motor in self.bus.motors})
+        if self.config.log_voltage:
+            ft.update({f"{motor}.volt": float for motor in self.bus.motors})
+        return ft
+
+    @property
     def _cameras_ft(self) -> dict[str, tuple]:
         return {
             cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
@@ -74,7 +86,7 @@ class SOFollower(Robot):
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        return {**self._motors_ft, **self._cameras_ft}
+        return {**self._motors_ft, **self._proprio_ft, **self._cameras_ft}
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -180,6 +192,18 @@ class SOFollower(Robot):
         start = time.perf_counter()
         obs_dict = self.bus.sync_read("Present_Position")
         obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()}
+
+        # Proprioceptive registers (thesis extension)
+        if self.config.log_current:
+            cur = self.bus.sync_read("Present_Current")
+            obs_dict.update({f"{motor}.cur": val for motor, val in cur.items()})
+        if self.config.log_temperature:
+            temp = self.bus.sync_read("Present_Temperature")
+            obs_dict.update({f"{motor}.temp": val for motor, val in temp.items()})
+        if self.config.log_voltage:
+            volt = self.bus.sync_read("Present_Voltage")
+            obs_dict.update({f"{motor}.volt": val for motor, val in volt.items()})
+
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
