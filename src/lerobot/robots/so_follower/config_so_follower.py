@@ -44,9 +44,15 @@ class SOFollowerConfig:
     # Proprioceptive register logging (thesis extension).
     # When enabled, the corresponding STS3215 registers are read alongside
     # position and included in observation_features for dataset recording.
+    # At training time, the policy config selects which features to use —
+    # storing extra channels in the dataset does not force the policy to see them.
     log_current: bool = False
     log_temperature: bool = False
     log_voltage: bool = False
+
+    # Thermal safety threshold (Celsius). If any servo exceeds this during
+    # recording, a warning is logged. STS3215 firmware limit is 80C.
+    temperature_warning_threshold: int = 60
 
 
 @RobotConfig.register_subclass("so101_follower")

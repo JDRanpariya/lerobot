@@ -200,6 +200,13 @@ class SOFollower(Robot):
         if self.config.log_temperature:
             temp = self.bus.sync_read("Present_Temperature")
             obs_dict.update({f"{motor}.temp": val for motor, val in temp.items()})
+            # Thermal safety monitoring
+            for motor_name, temp_val in temp.items():
+                if temp_val > self.config.temperature_warning_threshold:
+                    logger.warning(
+                        f"THERMAL WARNING: {motor_name} at {temp_val}C "
+                        f"(threshold: {self.config.temperature_warning_threshold}C)"
+                    )
         if self.config.log_voltage:
             volt = self.bus.sync_read("Present_Voltage")
             obs_dict.update({f"{motor}.volt": val for motor, val in volt.items()})
