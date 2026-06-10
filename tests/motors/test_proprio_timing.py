@@ -51,7 +51,7 @@ def main():
     times_pos = []
     for _ in range(N):
         t0 = time.perf_counter()
-        bus.sync_read("Present_Position")
+        bus.sync_read("Present_Position", normalize=False)
         times_pos.append(time.perf_counter() - t0)
 
     mean_pos = sum(times_pos) / len(times_pos) * 1000
@@ -64,8 +64,8 @@ def main():
     times_dual = []
     for _ in range(N):
         t0 = time.perf_counter()
-        bus.sync_read("Present_Position")
-        bus.sync_read("Present_Current")
+        bus.sync_read("Present_Position", normalize=False)
+        bus.sync_read("Present_Current", normalize=False)
         times_dual.append(time.perf_counter() - t0)
 
     mean_dual = sum(times_dual) / len(times_dual) * 1000
@@ -78,9 +78,9 @@ def main():
     times_triple = []
     for _ in range(N):
         t0 = time.perf_counter()
-        bus.sync_read("Present_Position")
-        bus.sync_read("Present_Current")
-        bus.sync_read("Present_Temperature")
+        bus.sync_read("Present_Position", normalize=False)
+        bus.sync_read("Present_Current", normalize=False)
+        bus.sync_read("Present_Temperature", normalize=False)
         times_triple.append(time.perf_counter() - t0)
 
     mean_triple = sum(times_triple) / len(times_triple) * 1000
@@ -93,10 +93,10 @@ def main():
     times_all = []
     for _ in range(N):
         t0 = time.perf_counter()
-        bus.sync_read("Present_Position")
-        bus.sync_read("Present_Current")
-        bus.sync_read("Present_Temperature")
-        bus.sync_read("Present_Voltage")
+        bus.sync_read("Present_Position", normalize=False)
+        bus.sync_read("Present_Current", normalize=False)
+        bus.sync_read("Present_Temperature", normalize=False)
+        bus.sync_read("Present_Voltage", normalize=False)
         times_all.append(time.perf_counter() - t0)
 
     mean_all = sum(times_all) / len(times_all) * 1000
