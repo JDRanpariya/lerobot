@@ -46,8 +46,8 @@ class SOFollowerConfig:
     # position and included in observation_features for dataset recording.
     # At training time, the policy config selects which features to use —
     # storing extra channels in the dataset does not force the policy to see them.
-    log_current: bool = False
-    log_temperature: bool = False
+    log_current: bool = True
+    log_temperature: bool = True
     log_voltage: bool = False
 
     # Thermal safety threshold (Celsius). If any servo exceeds this during
