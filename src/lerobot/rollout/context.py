@@ -279,7 +279,7 @@ def build_rollout_context(
     observation_features_hw = {
         k: v
         for k, v in all_obs_features.items()
-        if isinstance(v, tuple) or (v is float and k.endswith((".pos", ".cur", ".temp", ".volt")))
+        if isinstance(v, tuple) or (v is float and k.endswith((".pos", ".cur")))
     }
     action_features_hw = {k: v for k, v in robot.action_features.items() if k.endswith(".pos")}
 
