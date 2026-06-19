@@ -18,6 +18,7 @@ from __future__ import annotations
 # Utilities
 ########################################################################################
 import logging
+import os
 import traceback
 from contextlib import nullcontext
 from copy import copy
@@ -142,36 +143,79 @@ def init_keyboard_listener():
     events["rerecord_episode"] = False
     events["stop_recording"] = False
 
-    if is_headless():
-        logging.warning(
-            "Headless environment detected. On-screen cameras display and keyboard inputs will not be available."
-        )
-        listener = None
+    # Detect SSH/TTY sessions where pynput can't capture terminal keystrokes.
+    # Even with DISPLAY set (X11 forwarding), pynput monitors X11 events, not stdin.
+    _session_type = os.environ.get("XDG_SESSION_TYPE", "")
+    _is_ssh = bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"))
+    _prefer_ssh_keyboard = _is_ssh or _session_type == "tty"
+
+    if not is_headless() and not _prefer_ssh_keyboard:
+        # Use pynput when we have a real local display (not X11-forwarded SSH)
+        from pynput import keyboard
+
+        def on_press(key):
+            try:
+                if key == keyboard.Key.right:
+                    print("Right arrow key pressed. Exiting loop...")
+                    events["exit_early"] = True
+                elif key == keyboard.Key.left:
+                    print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+                    events["rerecord_episode"] = True
+                    events["exit_early"] = True
+                elif key == keyboard.Key.esc:
+                    print("Escape key pressed. Stopping data recording...")
+                    events["stop_recording"] = True
+                    events["exit_early"] = True
+            except Exception as e:
+                print(f"Error handling key press: {e}")
+
+        listener = keyboard.Listener(on_press=on_press)
+        listener.start()
         return listener, events
 
-    # Only import pynput if not in a headless environment
-    from pynput import keyboard
+    # Fallback: use sshkeyboard for SSH/headless environments
+    try:
+        import threading
+        from sshkeyboard import listen_keyboard, stop_listening
 
-    def on_press(key):
-        try:
-            if key == keyboard.Key.right:
+        def _on_press(key):
+            if key == "right":
                 print("Right arrow key pressed. Exiting loop...")
                 events["exit_early"] = True
-            elif key == keyboard.Key.left:
+            elif key == "left":
                 print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
                 events["rerecord_episode"] = True
                 events["exit_early"] = True
-            elif key == keyboard.Key.esc:
+            elif key == "esc":
                 print("Escape key pressed. Stopping data recording...")
                 events["stop_recording"] = True
                 events["exit_early"] = True
-        except Exception as e:
-            print(f"Error handling key press: {e}")
+                stop_listening()
 
-    listener = keyboard.Listener(on_press=on_press)
-    listener.start()
+        class _SSHKeyboardListener:
+            """Wrapper to match pynput Listener interface."""
+            def __init__(self):
+                self._thread = threading.Thread(
+                    target=listen_keyboard, kwargs={"on_press": _on_press}, daemon=True
+                )
 
-    return listener, events
+            def start(self):
+                self._thread.start()
+
+            def stop(self):
+                stop_listening()
+
+        listener = _SSHKeyboardListener()
+        listener.start()
+        logging.info("Using sshkeyboard for keyboard input (SSH/headless mode).")
+        return listener, events
+
+    except ImportError:
+        logging.warning(
+            "Headless environment detected and sshkeyboard not installed. "
+            "Keyboard inputs will not be available. Install with: pip install sshkeyboard"
+        )
+        return None, events
 
 
 def sanity_check_dataset_name(repo_id, policy_cfg):
