@@ -276,10 +276,18 @@ def build_rollout_context(
     # ``observation_features`` values are either a tuple (camera shape) or the
     # ``float`` type itself used as a sentinel for scalar motor features —
     # see ``dict[str, type | tuple]`` annotation on ``Robot.observation_features``.
+    # Policy-facing features: only .pos and .cur go into observation.state
     observation_features_hw = {
         k: v
         for k, v in all_obs_features.items()
         if isinstance(v, tuple) or (v is float and k.endswith((".pos", ".cur")))
+    }
+    # Auxiliary features for dataset recording only (not fed to policy).
+    # Temperature is logged as a separate "observation.temperature" column.
+    aux_temp_features = {
+        k: v
+        for k, v in all_obs_features.items()
+        if v is float and k.endswith(".temp")
     }
     action_features_hw = {k: v for k, v in robot.action_features.items() if k.endswith(".pos")}
 
@@ -297,6 +305,21 @@ def build_rollout_context(
         use_videos=cfg.dataset.video if cfg.dataset else True,
     )
     dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
+
+    # Inject auxiliary temperature feature for dataset recording.
+    # This creates a separate "observation.temperature" column in the parquet
+    # that is independent of "observation.state" and invisible to the policy.
+    if aux_temp_features:
+        dataset_features["observation.temperature"] = {
+            "dtype": "float32",
+            "shape": (len(aux_temp_features),),
+            "names": list(aux_temp_features.keys()),
+        }
+        logger.info(
+            "Temperature logging enabled: %d channels -> observation.temperature",
+            len(aux_temp_features),
+        )
+
     hw_features = hw_to_dataset_features(observation_features_hw, "observation")
     raw_action_keys = list(action_features_hw.keys())
     policy_action_names = getattr(policy_config, "action_feature_names", None)

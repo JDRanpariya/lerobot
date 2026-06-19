@@ -288,7 +288,13 @@ def send_next_action(
 
     if interpolator.needs_new_action():
         obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
-        action_tensor = engine.get_action(obs_frame)
+        # Strip auxiliary features (e.g. observation.temperature) that are recorded
+        # in the dataset but should not be fed to the policy.
+        policy_frame = {
+            k: v for k, v in obs_frame.items()
+            if not k.startswith("observation.temperature")
+        }
+        action_tensor = engine.get_action(policy_frame)
         if action_tensor is not None:
             interpolator.add(action_tensor.cpu())
 
