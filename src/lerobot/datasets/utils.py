@@ -342,6 +342,9 @@ def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> 
     If the exact version is not found, it looks for the latest version with the
     same major version number that is less than or equal to the target minor version.
 
+    For local datasets (repo_id starting with 'local/'), skip Hub lookup and
+    return the target version directly.
+
     Args:
         repo_id (str): The repository ID on the Hugging Face Hub.
         version (str | packaging.version.Version): The target version.
@@ -357,6 +360,11 @@ def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> 
     target_version = (
         packaging.version.parse(version) if not isinstance(version, packaging.version.Version) else version
     )
+
+    # Skip Hub lookup for local datasets
+    if repo_id.startswith("local/"):
+        return f"v{target_version}"
+
     hub_versions = get_repo_versions(repo_id)
 
     if not hub_versions:
