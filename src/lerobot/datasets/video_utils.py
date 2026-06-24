@@ -165,49 +165,55 @@ def decode_video_frames_pyav(
 
     This avoids the deprecated torchvision.io.VideoReader API which was removed
     in torchvision >= 0.27. Uses the av package to decode frames.
+
+    Memory-efficient: seeks to the region of interest and only decodes
+    frames within the requested timestamp range.
     """
     import av
 
     video_path = str(video_path)
     container = av.open(video_path)
     stream = container.streams.video[0]
+    stream.thread_type = "AUTO"
 
-    # Get video fps for timestamp -> pts conversion
-    fps = float(stream.average_rate)
     time_base = float(stream.time_base)
+    fps = float(stream.average_rate) if stream.average_rate else 30.0
+    frame_duration = 1.0 / fps
 
-    # Decode all frames and index by timestamp
-    frames_by_ts = []
+    # Determine the range we need to decode
+    first_ts = min(timestamps)
+    last_ts = max(timestamps)
+
+    # Seek to just before the first requested timestamp
+    seek_ts = max(0.0, first_ts - frame_duration * 2)
+    # av.seek uses stream time_base units
+    seek_pts = int(seek_ts / time_base)
+    container.seek(seek_pts, stream=stream)
+
+    # Decode frames in the range [first_ts - tolerance, last_ts + tolerance]
+    decoded_frames = []  # list of (timestamp, numpy_array)
+    cutoff = last_ts + tolerance_s + frame_duration
+
     for frame in container.decode(video=0):
         t = float(frame.pts * time_base)
-        img = frame.to_ndarray(format="rgb24")  # H, W, 3
-        frames_by_ts.append((t, img))
+        if t > cutoff:
+            break
+        if t >= seek_ts:
+            decoded_frames.append((t, frame.to_ndarray(format="rgb24")))
 
     container.close()
 
-    if not frames_by_ts:
-        raise RuntimeError(f"No frames decoded from {video_path}")
+    if not decoded_frames:
+        raise RuntimeError(f"No frames decoded from {video_path} for timestamps {timestamps}")
 
-    # For each requested timestamp, find the closest frame within tolerance
+    # For each requested timestamp, find the closest decoded frame
     result = []
-    frame_timestamps = [t for t, _ in frames_by_ts]
+    frame_ts_array = np.array([t for t, _ in decoded_frames])
 
     for req_ts in timestamps:
-        best_idx = None
-        best_diff = float("inf")
-        for i, ft in enumerate(frame_timestamps):
-            diff = abs(ft - req_ts)
-            if diff < best_diff:
-                best_diff = diff
-                best_idx = i
-
-        if best_idx is None or best_diff > tolerance_s + 1.0 / fps:
-            # Fallback: use nearest frame anyway
-            import bisect
-            best_idx = bisect.bisect_left(frame_timestamps, req_ts)
-            best_idx = min(best_idx, len(frame_timestamps) - 1)
-
-        result.append(frames_by_ts[best_idx][1])
+        diffs = np.abs(frame_ts_array - req_ts)
+        best_idx = int(np.argmin(diffs))
+        result.append(decoded_frames[best_idx][1])
 
     # Convert to tensor: (N, C, H, W)
     frames_array = np.stack(result)  # (N, H, W, 3)
