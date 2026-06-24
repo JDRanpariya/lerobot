@@ -145,12 +145,78 @@ def decode_video_frames(
         backend = get_safe_default_codec()
     if backend == "torchcodec":
         return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, return_uint8=return_uint8)
-    elif backend in ["pyav", "video_reader"]:
+    elif backend == "pyav":
+        return decode_video_frames_pyav(video_path, timestamps, tolerance_s, return_uint8=return_uint8)
+    elif backend == "video_reader":
         return decode_video_frames_torchvision(
             video_path, timestamps, tolerance_s, backend, return_uint8=return_uint8
         )
     else:
         raise ValueError(f"Unsupported video backend: {backend}")
+
+
+def decode_video_frames_pyav(
+    video_path: Path | str,
+    timestamps: list[float],
+    tolerance_s: float,
+    return_uint8: bool = False,
+) -> torch.Tensor:
+    """Decode video frames using av (pyav) directly.
+
+    This avoids the deprecated torchvision.io.VideoReader API which was removed
+    in torchvision >= 0.27. Uses the av package to decode frames.
+    """
+    import av
+
+    video_path = str(video_path)
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+
+    # Get video fps for timestamp -> pts conversion
+    fps = float(stream.average_rate)
+    time_base = float(stream.time_base)
+
+    # Decode all frames and index by timestamp
+    frames_by_ts = []
+    for frame in container.decode(video=0):
+        t = float(frame.pts * time_base)
+        img = frame.to_ndarray(format="rgb24")  # H, W, 3
+        frames_by_ts.append((t, img))
+
+    container.close()
+
+    if not frames_by_ts:
+        raise RuntimeError(f"No frames decoded from {video_path}")
+
+    # For each requested timestamp, find the closest frame within tolerance
+    result = []
+    frame_timestamps = [t for t, _ in frames_by_ts]
+
+    for req_ts in timestamps:
+        best_idx = None
+        best_diff = float("inf")
+        for i, ft in enumerate(frame_timestamps):
+            diff = abs(ft - req_ts)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = i
+
+        if best_idx is None or best_diff > tolerance_s + 1.0 / fps:
+            # Fallback: use nearest frame anyway
+            import bisect
+            best_idx = bisect.bisect_left(frame_timestamps, req_ts)
+            best_idx = min(best_idx, len(frame_timestamps) - 1)
+
+        result.append(frames_by_ts[best_idx][1])
+
+    # Convert to tensor: (N, C, H, W)
+    frames_array = np.stack(result)  # (N, H, W, 3)
+    tensor = torch.from_numpy(frames_array).permute(0, 3, 1, 2)  # (N, 3, H, W)
+
+    if return_uint8:
+        return tensor
+    else:
+        return tensor.float() / 255.0
 
 
 def decode_video_frames_torchvision(
