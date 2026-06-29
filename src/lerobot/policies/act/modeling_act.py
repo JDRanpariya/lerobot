@@ -37,6 +37,8 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 from ..pretrained import PreTrainedPolicy
 from .configuration_act import ACTConfig
+from .fusion_modules import build_fusion_module
+from .temporal_encoders import build_temporal_encoder
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -333,6 +335,17 @@ class ACT(nn.Module):
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
+        # Temporal encoder for proprioceptive signals (thesis extension)
+        if self.config.proprio_temporal_encoder != "none" or self.config.proprio_fusion_stage != "early":
+            self.temporal_encoder = build_temporal_encoder(
+                config,
+                state_dim=config.robot_state_feature.shape[0] if config.robot_state_feature else 0,
+            )
+            self.fusion_module = build_fusion_module(config)
+        else:
+            self.temporal_encoder = None
+            self.fusion_module = None
+
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
         self.decoder = ACTDecoder(config)
@@ -357,6 +370,9 @@ class ACT(nn.Module):
         if self.config.robot_state_feature:
             n_1d_tokens += 1
         if self.config.env_state_feature:
+            n_1d_tokens += 1
+        # Reserve extra token for temporal features (token/hybrid fusion)
+        if self.config.proprio_fusion_stage in ("token", "hybrid"):
             n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
@@ -457,33 +473,70 @@ class ACT(nn.Module):
                 batch[OBS_STATE].device
             )
 
-        # Prepare transformer encoder inputs.
-        encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
-        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
-        # Robot state token.
-        if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
-        # Environment state token.
-        if self.config.env_state_feature:
-            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+        # === THESIS EXTENSION: temporal encoding ===
+        if self.temporal_encoder is not None:
+            batch = self.temporal_encoder(batch)
+        # =============================================
 
-        if self.config.image_features:
-            # For a list of images, the H and W may vary but H*W is constant.
-            # NOTE: If modifying this section, verify on MPS devices that
-            # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+        # Prepare transformer encoder inputs via fusion module
+        if self.fusion_module is not None:
+            # Collect vision tokens first (needed by fusion module)
+            vision_tokens_list = []
+            if self.config.image_features:
+                for img in batch[OBS_IMAGES]:
+                    cam_features = self.backbone(img)["feature_map"]
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
+                    cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                    vision_tokens_list.append(cam_features)
 
-                # Rearrange features to (sequence, batch, dim).
-                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
-                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+            latent_token = self.encoder_latent_input_proj(latent_sample)
+            state_token = (
+                self.encoder_robot_state_input_proj(batch[OBS_STATE])
+                if self.config.robot_state_feature
+                else None
+            )
 
-                # Extend immediately instead of accumulating and concatenating
-                # Convert to list to extend properly
-                encoder_in_tokens.extend(list(cam_features))
-                encoder_in_pos_embed.extend(list(cam_pos_embed))
+            encoder_in_tokens = self.fusion_module(
+                latent=latent_token,
+                state=state_token,
+                vision_tokens=vision_tokens_list,
+                temporal_features=batch.get("proprio_embedding"),
+                contact_mask=batch.get("contact_mask"),
+                film_params=(batch.get("film_gamma"), batch.get("film_beta")),
+            )
+            # Build positional embeddings matching token structure
+            encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+            # Pad pos_embeds to match token count (fusion may add temporal token)
+            while len(encoder_in_pos_embed) < len(encoder_in_tokens):
+                encoder_in_pos_embed.append(encoder_in_pos_embed[-1])  # repeat last
+        else:
+            # === ORIGINAL CODE PATH (no temporal/fusion) ===
+            encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
+            encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+            # Robot state token.
+            if self.config.robot_state_feature:
+                encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            # Environment state token.
+            if self.config.env_state_feature:
+                encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+
+            if self.config.image_features:
+                # For a list of images, the H and W may vary but H*W is constant.
+                # NOTE: If modifying this section, verify on MPS devices that
+                # gradients remain stable (no explosions or NaNs).
+                for img in batch[OBS_IMAGES]:
+                    cam_features = self.backbone(img)["feature_map"]
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
+
+                    # Rearrange features to (sequence, batch, dim).
+                    cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+
+                    # Extend immediately instead of accumulating and concatenating
+                    # Convert to list to extend properly
+                    encoder_in_tokens.extend(list(cam_features))
+                    encoder_in_pos_embed.extend(list(cam_pos_embed))
 
         # Stack all tokens along the sequence dimension.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)

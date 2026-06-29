@@ -127,10 +127,68 @@ class ACTConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
 
+    # === TEMPORAL ENCODING for proprioceptive signals ===
+    # What: how the current time-series is represented before fusion
+    proprio_temporal_encoder: str = "none"  # none | history | explicit | cnn
+    proprio_K: int = 9                      # history window steps (Method 1)
+    # Which state indices contain current channels (for temporal encoders)
+    # Default: indices 6-11 in act-m view (position 0-5, current 6-11)
+    proprio_current_indices: list[int] = field(default_factory=lambda: [6, 7, 8, 9, 10, 11])
+    # Explicit features to compute (Method 2)
+    proprio_explicit_features: list[str] = field(default_factory=lambda: [
+        "raw", "derivative", "residual", "variance", "peak", "power", "impulse"
+    ])
+    # CNN architecture (Method 3)
+    proprio_cnn_channels: list[int] = field(default_factory=lambda: [16, 16, 8])
+    proprio_cnn_kernel_sizes: list[int] = field(default_factory=lambda: [3, 3, 3])
+    proprio_cnn_dilations: list[int] = field(default_factory=lambda: [1, 2, 4])
+
+    # === FUSION STAGE ===
+    # Where: at what architectural depth temporal features fuse with vision
+    proprio_fusion_stage: str = "early"  # early | token | film | hybrid
+
+    # Contact detection thresholds (for hybrid fusion, Method 4)
+    proprio_contact_threshold_I: float = 50.0
+    proprio_contact_threshold_dI: float = 20.0
+    # Gripper position index in state vector for contact detection
+    proprio_gripper_idx: int = 5
+
+    # FiLM conditioning layers (1-indexed ResNet blocks)
+    proprio_film_layers: list[int] = field(default_factory=lambda: [1, 2, 3])
+
+    # === ADAPTIVE TRAINING (FACTR + OGM-GE reserve) ===
+    use_factr: bool = False
+    factr_T_decay: int = 30000
+    factr_sigma_max: float = 8.0
+    use_ogm_ge: bool = False
+
     def __post_init__(self):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        # Validate temporal encoder
+        valid_temporal = {"none", "history", "explicit", "cnn"}
+        if self.proprio_temporal_encoder not in valid_temporal:
+            raise ValueError(
+                f"`proprio_temporal_encoder` must be one of {valid_temporal}. "
+                f"Got '{self.proprio_temporal_encoder}'."
+            )
+        # Validate fusion stage
+        valid_fusion = {"early", "token", "film", "hybrid"}
+        if self.proprio_fusion_stage not in valid_fusion:
+            raise ValueError(
+                f"`proprio_fusion_stage` must be one of {valid_fusion}. "
+                f"Got '{self.proprio_fusion_stage}'."
+            )
+        # Validate temporal+fusion compatibility
+        if self.proprio_temporal_encoder == "none" and self.proprio_fusion_stage != "early":
+            raise ValueError(
+                "When temporal_encoder='none', fusion_stage must be 'early'."
+            )
+        if self.proprio_temporal_encoder == "cnn" and self.proprio_fusion_stage == "film":
+            raise NotImplementedError(
+                "CNN temporal encoder with FiLM fusion is not yet implemented."
+            )
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
