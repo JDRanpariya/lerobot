@@ -99,6 +99,12 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
+        # === THESIS EXTENSION: reset state history buffer ===
+        if self.config.proprio_temporal_encoder in ("history", "cnn"):
+            from collections import deque
+            self._state_history = deque([], maxlen=self.config.proprio_K + 1)
+        # =====================================================
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
@@ -108,6 +114,18 @@ class ACTPolicy(PreTrainedPolicy):
         queue is empty.
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
+
+        # === THESIS EXTENSION: maintain state history for temporal encoders ===
+        if self.config.proprio_temporal_encoder in ("history", "cnn"):
+            batch = dict(batch)  # shallow copy
+            state = batch["observation.state"]
+            self._state_history.append(state)
+            # Pad history if shorter than K+1
+            while len(self._state_history) < self.config.proprio_K + 1:
+                self._state_history.appendleft(torch.zeros_like(state))
+            # Concatenate history into expanded state vector
+            batch["observation.state"] = torch.cat(list(self._state_history), dim=-1)
+        # ======================================================================
 
         if self.config.temporal_ensemble_coeff is not None:
             actions = self.predict_action_chunk(batch)
@@ -478,16 +496,38 @@ class ACT(nn.Module):
             batch = self.temporal_encoder(batch)
         # =============================================
 
+        # === THESIS EXTENSION: FiLM conditioning on backbone ===
+        film_gamma = film_beta = None
+        if self.config.proprio_fusion_stage == "film" and "film_gamma" in batch:
+            film_gamma = batch["film_gamma"]
+            film_beta = batch["film_beta"]
+        # ========================================================
+
         # Prepare transformer encoder inputs via fusion module
         if self.fusion_module is not None:
-            # Collect vision tokens first (needed by fusion module)
+            # Process images through backbone (with optional FiLM modulation)
             vision_tokens_list = []
+            cam_pos_embeds_list = []
             if self.config.image_features:
                 for img in batch[OBS_IMAGES]:
+                    # Backbone forward
                     cam_features = self.backbone(img)["feature_map"]
+
+                    # Apply FiLM if parameters present
+                    if film_gamma is not None and hasattr(self.fusion_module, 'apply_film'):
+                        cam_features = self.fusion_module.apply_film(
+                            cam_features, film_gamma, film_beta
+                        )
+
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                     cam_features = self.encoder_img_feat_input_proj(cam_features)
+
+                    # Rearrange features to (sequence, batch, dim).
                     cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+
                     vision_tokens_list.append(cam_features)
+                    cam_pos_embeds_list.append(cam_pos_embed)
 
             latent_token = self.encoder_latent_input_proj(latent_sample)
             state_token = (
@@ -506,6 +546,9 @@ class ACT(nn.Module):
             )
             # Build positional embeddings matching token structure
             encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+            # Add camera positional embeddings
+            for cpe in cam_pos_embeds_list:
+                encoder_in_pos_embed.extend(list(cpe))
             # Pad pos_embeds to match token count (fusion may add temporal token)
             while len(encoder_in_pos_embed) < len(encoder_in_tokens):
                 encoder_in_pos_embed.append(encoder_in_pos_embed[-1])  # repeat last

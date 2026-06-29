@@ -136,41 +136,63 @@ class FiLMFusion(BaseFusionModule):
     The temporal encoder produces (gamma, beta) vectors that scale and shift
     the ResNet feature maps before they enter the transformer. This avoids
     adding tokens to the sequence (no attention competition).
-
-    Implementation: We apply FiLM at specific ResNet layers via forward hooks.
-    Since this module doesn't directly return modified vision tokens, it stores
-    film_params in the batch dict and the ACT model applies them in backbone forward.
     """
 
     def __init__(self, config: ACTConfig):
         super().__init__(config)
-        # FiLM parameters are computed by the temporal encoder
-        # This module mainly acts as a pass-through with metadata
         self.film_layers = config.proprio_film_layers
+        # MLP that produces per-channel gamma and beta from temporal features
+        # Input: concatenated temporal features (size varies by encoder)
+        # Output: 2 * backbone_channels (gamma + beta per channel)
+        # We use a flexible MLP; actual dimensions set on first forward
+        self.film_mlp = None
+        self._backbone_channels = None
 
-    def forward(self, latent, state, vision_tokens, film_params=None, **kwargs):
+    def _build_film_mlp(self, temporal_dim: int, backbone_channels: int):
+        """Lazy build of FiLM generator."""
+        self.film_mlp = nn.Sequential(
+            nn.Linear(temporal_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, backbone_channels * 2),
+        )
+        self._backbone_channels = backbone_channels
+
+    def forward(self, latent, state, vision_tokens, temporal_features=None,
+                film_params=None, **kwargs):
         tokens = [latent, state]
-        # FiLM is applied to vision tokens BEFORE they reach here
-        # (ACT model applies film to backbone output if film_params present)
+        # FiLM params are pre-computed by temporal encoder and stored in batch
+        # Vision tokens are already modulated by ACT model's backbone forward
         tokens.extend(vision_tokens)
         return tokens
 
-    def n_non_vision_tokens(self) -> int:
-        return 2  # latent + state (no extra temporal token)
+    def compute_film_params(self, temporal_features: Tensor,
+                           backbone_channels: int) -> tuple[Tensor, Tensor]:
+        """Compute (gamma, beta) from temporal features.
+        Called by ACT model before backbone forward.
+        """
+        if self.film_mlp is None or self._backbone_channels != backbone_channels:
+            self._build_film_mlp(temporal_features.shape[-1], backbone_channels)
+            # Move to same device
+            self.film_mlp = self.film_mlp.to(temporal_features.device)
+
+        film_out = self.film_mlp(temporal_features)  # (B, 2*C)
+        gamma, beta = film_out.chunk(2, dim=-1)  # each (B, C)
+        return gamma, beta
 
     def apply_film(self, feature_map: Tensor, gamma: Tensor, beta: Tensor) -> Tensor:
-        """Apply FiLM: feature_map * gamma + beta.
-
+        """Apply FiLM: feature_map * (1 + gamma) + beta.
         Args:
             feature_map: (B, C, H, W)
-            gamma: (B, C) broadcast to (B, C, 1, 1)
-            beta: (B, C) broadcast to (B, C, 1, 1)
+            gamma, beta: (B, C)
         Returns:
-            (B, C, H, W) modulated feature map
+            (B, C, H, W)
         """
         gamma = gamma.unsqueeze(-1).unsqueeze(-1)
         beta = beta.unsqueeze(-1).unsqueeze(-1)
         return feature_map * (1 + gamma) + beta
+
+    def n_non_vision_tokens(self) -> int:
+        return 2  # latent + state (no extra temporal token)
 
 
 class HybridFusion(BaseFusionModule):
