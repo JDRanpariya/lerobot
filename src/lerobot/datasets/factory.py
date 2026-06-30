@@ -129,4 +129,30 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
+    # === THESIS EXTENSION: temporal-window wrapper for history-based encoders ===
+    # When the policy uses a temporal encoder that needs a K-step current
+    # history (history / cnn / explicit), wrap the dataset so each item
+    # also carries an `observation.state_window` of past currents. The
+    # wrapper preserves episode boundaries (zero-pad before episode start).
+    _enc = getattr(getattr(cfg, "trainable_config", None), "proprio_temporal_encoder", "none")
+    _K = getattr(getattr(cfg, "trainable_config", None), "proprio_K", 0)
+    if _enc in ("history", "cnn", "explicit") and _K and _K > 0:
+        try:
+            from .temporal_window import TemporalWindowDataset
+            _cur_idx = getattr(cfg.trainable_config, "proprio_current_indices", None)
+            dataset = TemporalWindowDataset(
+                dataset, K=int(_K), state_indices=_cur_idx
+            )
+            logging.info(
+                f"Wrapped dataset with TemporalWindowDataset "
+                f"(K={_K}, enc={_enc}, n_current={len(_cur_idx) if _cur_idx is not None else 'all'})"
+            )
+        except Exception as e:  # pragma: no cover - surface, don't silently train on wrong obs
+            logging.warning(
+                f"TemporalWindowDataset wrap requested but failed ({e}); "
+                f"training will proceed WITHOUT the state_window -> temporal "
+                f"encoders that need it will crash on forward."
+            )
+    # ============================================================================
+
     return dataset

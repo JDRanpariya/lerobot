@@ -100,8 +100,10 @@ class ACTPolicy(PreTrainedPolicy):
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
         # === THESIS EXTENSION: reset state history buffer ===
-        if self.config.proprio_temporal_encoder in ("history", "cnn"):
-            from collections import deque
+        if (
+            self.config.proprio_temporal_encoder in ("history", "cnn", "explicit")
+            and self.config.proprio_K > 0
+        ):
             self._state_history = deque([], maxlen=self.config.proprio_K + 1)
         # =====================================================
 
@@ -116,15 +118,23 @@ class ACTPolicy(PreTrainedPolicy):
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
 
         # === THESIS EXTENSION: maintain state history for temporal encoders ===
-        if self.config.proprio_temporal_encoder in ("history", "cnn"):
+        if (
+            self.config.proprio_temporal_encoder in ("history", "cnn", "explicit")
+            and self.config.proprio_K > 0
+        ):
             batch = dict(batch)  # shallow copy
             state = batch["observation.state"]
             self._state_history.append(state)
             # Pad history if shorter than K+1
             while len(self._state_history) < self.config.proprio_K + 1:
                 self._state_history.appendleft(torch.zeros_like(state))
-            # Concatenate history into expanded state vector
-            batch["observation.state"] = torch.cat(list(self._state_history), dim=-1)
+            # Build state_window from current channels only
+            current_indices = getattr(
+                self.config, "proprio_current_indices", list(range(state.shape[-1] // 2, state.shape[-1]))
+            )
+            hist = torch.stack(list(self._state_history), dim=1)  # (B, K+1, state_dim)
+            window = hist[..., current_indices]  # (B, K+1, n_current)
+            batch["observation.state_window"] = window.view(window.shape[0], -1)
         # ======================================================================
 
         if self.config.temporal_ensemble_coeff is not None:
@@ -316,23 +326,52 @@ class ACT(nn.Module):
         super().__init__()
         self.config = config
 
+        # === THESIS EXTENSION: temporal encoder + fusion module (instantiated first) ===
+        # We need the post-temporal state dimension to size every state projection
+        # layer (VAE + transformer encoder), so this block runs before them.
+        robot_state_dim = self.config.robot_state_feature.shape[0] if self.config.robot_state_feature else 0
+        # The vision backbone's output channel count is needed eagerly by the
+        # FiLM fusion module, so compute it up front (without building the model
+        # twice -- the actual backbone is constructed further below).
+        backbone_out_channels = 0
+        if self.config.image_features:
+            backbone_out_channels = getattr(
+                torchvision.models, config.vision_backbone
+            )().fc.in_features
+        if self.config.proprio_temporal_encoder != "none" or self.config.proprio_fusion_stage != "early":
+            self.temporal_encoder = build_temporal_encoder(
+                config,
+                state_dim=robot_state_dim,
+            )
+            # Build the fusion module EAGERLY with the temporal embedding width
+            # and backbone channel count so its projection layers / FiLM MLP are
+            # registered before the optimizer is constructed (otherwise their
+            # parameters never get gradient updates).
+            self.fusion_module = build_fusion_module(
+                config,
+                temporal_dim=self.temporal_encoder.embedding_dim(),
+                backbone_channels=backbone_out_channels or None,
+            )
+            self.temporal_encoder_state_dim = self.temporal_encoder.output_state_dim()
+        else:
+            self.temporal_encoder = None
+            self.fusion_module = None
+            self.temporal_encoder_state_dim = robot_state_dim
+        # =================================================================================
+
+        # VAE encoder (BERT-style, input [cls, robot_state, *action_sequence]).
         if self.config.use_vae:
             self.vae_encoder = ACTEncoder(config, is_vae_encoder=True)
             self.vae_encoder_cls_embed = nn.Embedding(1, config.dim_model)
-            # Projection layer for joint-space configuration to hidden dimension.
             if self.config.robot_state_feature:
                 self.vae_encoder_robot_state_input_proj = nn.Linear(
-                    self.config.robot_state_feature.shape[0], config.dim_model
+                    self.temporal_encoder_state_dim, config.dim_model
                 )
-            # Projection layer for action (joint-space target) to hidden dimension.
             self.vae_encoder_action_input_proj = nn.Linear(
                 self.config.action_feature.shape[0],
                 config.dim_model,
             )
-            # Projection layer from the VAE encoder's output to the latent distribution's parameter space.
             self.vae_encoder_latent_output_proj = nn.Linear(config.dim_model, config.latent_dim * 2)
-            # Fixed sinusoidal positional embedding for the input to the VAE encoder. Unsqueeze for batch
-            # dimension.
             num_input_token_encoder = 1 + config.chunk_size
             if self.config.robot_state_feature:
                 num_input_token_encoder += 1
@@ -342,6 +381,7 @@ class ACT(nn.Module):
             )
 
         # Backbone for image feature extraction.
+        backbone_out_channels = 0
         if self.config.image_features:
             backbone_model = getattr(torchvision.models, config.vision_backbone)(
                 replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
@@ -352,17 +392,7 @@ class ACT(nn.Module):
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
-
-        # Temporal encoder for proprioceptive signals (thesis extension)
-        if self.config.proprio_temporal_encoder != "none" or self.config.proprio_fusion_stage != "early":
-            self.temporal_encoder = build_temporal_encoder(
-                config,
-                state_dim=config.robot_state_feature.shape[0] if config.robot_state_feature else 0,
-            )
-            self.fusion_module = build_fusion_module(config)
-        else:
-            self.temporal_encoder = None
-            self.fusion_module = None
+            backbone_out_channels = backbone_model.fc.in_features
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -372,7 +402,7 @@ class ACT(nn.Module):
         # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
         if self.config.robot_state_feature:
             self.encoder_robot_state_input_proj = nn.Linear(
-                self.config.robot_state_feature.shape[0], config.dim_model
+                self.temporal_encoder_state_dim, config.dim_model
             )
         if self.config.env_state_feature:
             self.encoder_env_state_input_proj = nn.Linear(
@@ -381,7 +411,7 @@ class ACT(nn.Module):
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                backbone_out_channels, config.dim_model, kernel_size=1
             )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
@@ -389,9 +419,9 @@ class ACT(nn.Module):
             n_1d_tokens += 1
         if self.config.env_state_feature:
             n_1d_tokens += 1
-        # Reserve extra token for temporal features (token/hybrid fusion)
-        if self.config.proprio_fusion_stage in ("token", "hybrid"):
-            n_1d_tokens += 1
+        # NOTE: the temporal token's positional embedding is NOT reserved here.
+        # It is owned by the fusion module (token/hybrid) and injected in forward
+        # via fusion_module.get_extra_pos_embed(); see the fusion path below.
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
             self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
@@ -434,6 +464,13 @@ class ACT(nn.Module):
             assert ACTION in batch, (
                 "actions must be provided when using the variational objective in training mode."
             )
+
+        # === THESIS EXTENSION: temporal encoding (before VAE and backbone) ===
+        # The CVAE encoder and the transformer encoder must observe the same
+        # temporally-enhanced state vector.
+        if self.temporal_encoder is not None:
+            batch = self.temporal_encoder(batch)
+        # ======================================================================
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
 
@@ -491,33 +528,27 @@ class ACT(nn.Module):
                 batch[OBS_STATE].device
             )
 
-        # === THESIS EXTENSION: temporal encoding ===
-        if self.temporal_encoder is not None:
-            batch = self.temporal_encoder(batch)
-        # =============================================
-
-        # === THESIS EXTENSION: FiLM conditioning on backbone ===
-        film_gamma = film_beta = None
-        if self.config.proprio_fusion_stage == "film" and "film_gamma" in batch:
-            film_gamma = batch["film_gamma"]
-            film_beta = batch["film_beta"]
-        # ========================================================
-
         # Prepare transformer encoder inputs via fusion module
         if self.fusion_module is not None:
             # Process images through backbone (with optional FiLM modulation)
-            vision_tokens_list = []
+            vision_tokens_list = []  # each element: list of (B, dim_model) tokens
             cam_pos_embeds_list = []
             if self.config.image_features:
                 for img in batch[OBS_IMAGES]:
-                    # Backbone forward
                     cam_features = self.backbone(img)["feature_map"]
 
-                    # Apply FiLM if parameters present
-                    if film_gamma is not None and hasattr(self.fusion_module, 'apply_film'):
-                        cam_features = self.fusion_module.apply_film(
-                            cam_features, film_gamma, film_beta
+                    # === THESIS EXTENSION: FiLM conditioning on backbone ===
+                    if (
+                        self.config.proprio_fusion_stage == "film"
+                        and "proprio_embedding" in batch
+                    ):
+                        gamma, beta = self.fusion_module.compute_film_params(
+                            batch["proprio_embedding"], cam_features.shape[1]
                         )
+                        cam_features = self.fusion_module.apply_film(
+                            cam_features, gamma, beta
+                        )
+                    # ========================================================
 
                     cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                     cam_features = self.encoder_img_feat_input_proj(cam_features)
@@ -526,8 +557,9 @@ class ACT(nn.Module):
                     cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
                     cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
 
-                    vision_tokens_list.append(cam_features)
-                    cam_pos_embeds_list.append(cam_pos_embed)
+                    # Split into per-token (B, dim_model) slices.
+                    vision_tokens_list.append(list(cam_features))
+                    cam_pos_embeds_list.append(list(cam_pos_embed))
 
             latent_token = self.encoder_latent_input_proj(latent_sample)
             state_token = (
@@ -536,22 +568,43 @@ class ACT(nn.Module):
                 else None
             )
 
+            # Flatten vision tokens into one list for the fusion module.
+            flat_vision_tokens = []
+            for vt in vision_tokens_list:
+                flat_vision_tokens.extend(vt)
+
+            temporal_features = batch.get("proprio_embedding")
             encoder_in_tokens = self.fusion_module(
                 latent=latent_token,
                 state=state_token,
-                vision_tokens=vision_tokens_list,
-                temporal_features=batch.get("proprio_embedding"),
+                vision_tokens=flat_vision_tokens,
+                temporal_features=temporal_features,
                 contact_mask=batch.get("contact_mask"),
-                film_params=(batch.get("film_gamma"), batch.get("film_beta")),
             )
-            # Build positional embeddings matching token structure
+            # Build positional embeddings matching the EXACT token structure the
+            # fusion module produced: [latent, (state), (temporal), vision...].
+            # encoder_1d_feature_pos_embed covers latent + optional state/env only;
+            # the temporal token has its own pos embed owned by the fusion module.
             encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
-            # Add camera positional embeddings
+            # Insert the temporal token's positional embedding (if a temporal
+            # token was actually appended this forward pass).
+            if (
+                temporal_features is not None
+                and hasattr(self.fusion_module, "get_extra_pos_embed")
+            ):
+                extra_pos = self.fusion_module.get_extra_pos_embed().to(
+                    encoder_in_pos_embed[0].dtype
+                )
+                # Append after the 1d (latent/state) embeds, before vision.
+                encoder_in_pos_embed.append(extra_pos[0])
+            # Add camera positional embeddings.
             for cpe in cam_pos_embeds_list:
-                encoder_in_pos_embed.extend(list(cpe))
-            # Pad pos_embeds to match token count (fusion may add temporal token)
-            while len(encoder_in_pos_embed) < len(encoder_in_tokens):
-                encoder_in_pos_embed.append(encoder_in_pos_embed[-1])  # repeat last
+                encoder_in_pos_embed.extend(cpe)
+            # Sanity check: token / pos-embed counts must match exactly.
+            assert len(encoder_in_pos_embed) == len(encoder_in_tokens), (
+                f"pos-embed/token mismatch: {len(encoder_in_pos_embed)} "
+                f"!= {len(encoder_in_tokens)}"
+            )
         else:
             # === ORIGINAL CODE PATH (no temporal/fusion) ===
             encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]

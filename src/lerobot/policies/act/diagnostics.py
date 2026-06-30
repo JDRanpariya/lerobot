@@ -53,7 +53,7 @@ class ModalityDiagnostics:
         self.config = policy.config
 
         # Identify current channel indices in state vector
-        self.current_indices = getattr(config, "proprio_current_indices", list(range(6, 12)))
+        self.current_indices = getattr(self.config, "proprio_current_indices", list(range(6, 12)))
         self.position_indices = list(range(6))  # first 6 are positions
 
     # ------------------------------------------------------------------
@@ -77,11 +77,20 @@ class ModalityDiagnostics:
             # Full prediction
             actions_full = self.policy.predict_action_chunk(batch)
 
-            # Zero-out current channels
+            # Zero-out current channels in both instantaneous state and window
             batch_zero = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()}
-            state = batch_zero["observation.state"].clone()
-            state[..., self.current_indices] = 0.0
-            batch_zero["observation.state"] = state
+            if "observation.state" in batch_zero:
+                state = batch_zero["observation.state"].clone()
+                state[..., self.current_indices] = 0.0
+                batch_zero["observation.state"] = state
+            if "observation.state_window" in batch_zero:
+                window = batch_zero["observation.state_window"].clone()
+                # state_window is [I_t, I_{t-1}, ..., I_{t-K}] repeated n_current channels
+                n_current = len(self.current_indices)
+                K_plus_1 = window.shape[-1] // n_current
+                for k in range(K_plus_1):
+                    window[..., k * n_current : (k + 1) * n_current] = 0.0
+                batch_zero["observation.state_window"] = window
 
             actions_zero = self.policy.predict_action_chunk(batch_zero)
 
@@ -97,6 +106,59 @@ class ModalityDiagnostics:
                 "ratio": (l2_dist.mean() / (action_norm.mean() + 1e-8)).item(),
                 "n_samples": actions_full.shape[0],
             }
+
+    def position_control_zero_out(
+        self,
+        batch: Dict[str, Tensor],
+    ) -> Dict[str, float]:
+        """Same as zero_out_l2 but zeros the POSITION channels (control).
+
+        Used to normalise the current-channel impact: a variant is 'using'
+        the current channels iff z_curr > z_pos / r (suggested r=20).
+        """
+        pos_idx = list(set(range(batch["observation.state"].shape[-1]))
+                       - set(self.current_indices))
+        with torch.no_grad():
+            actions_full = self.policy.predict_action_chunk(batch)
+            batch_zero = {k: v.clone() if torch.is_tensor(v) else v
+                          for k, v in batch.items()}
+            if "observation.state" in batch_zero:
+                state = batch_zero["observation.state"].clone()
+                state[..., pos_idx] = 0.0
+                batch_zero["observation.state"] = state
+            actions_zero = self.policy.predict_action_chunk(batch_zero)
+            l2_dist = torch.norm(actions_full - actions_zero, dim=(1, 2))
+            action_norm = torch.norm(actions_full, dim=(1, 2))
+            return {
+                "mean_l2": l2_dist.mean().item(),
+                "ratio": (l2_dist.mean() / (action_norm.mean() + 1e-8)).item(),
+                "n_samples": actions_full.shape[0],
+            }
+
+    def relative_use_metric(
+        self,
+        batch: Dict[str, Tensor],
+        ratio_threshold: float = 20.0,
+    ) -> Dict[str, float]:
+        """Combined modality-use verdict (ADR-0011).
+
+        Returns z_curr, z_pos, their ratio, and a boolean 'used' flag.
+        'used' == True  => current channels shift the action by at least
+        z_pos / ratio_threshold (suggested 20 => 5% of position impact).
+        """
+        zc = self.zero_out_l2(batch)
+        zp = self.position_control_zero_out(batch)
+        z_curr = zc["ratio"]
+        z_pos = zp["ratio"]
+        rel = z_curr / (z_pos + 1e-8)
+        return {
+            "z_curr": z_curr,
+            "z_pos": z_pos,
+            "relative_curr": rel,
+            "used": bool(rel > 1.0 / ratio_threshold),
+            "threshold_ratio": 1.0 / ratio_threshold,
+            "n_samples": zc["n_samples"],
+        }
 
     # ------------------------------------------------------------------
     # 2. Gradient ratio

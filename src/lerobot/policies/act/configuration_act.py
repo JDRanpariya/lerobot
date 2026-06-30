@@ -167,7 +167,7 @@ class ACTConfig(PreTrainedConfig):
 
         """Input validation (not exhaustive)."""
         # Validate temporal encoder
-        valid_temporal = {"none", "history", "explicit", "cnn"}
+        valid_temporal = {"none", "history", "explicit", "cnn", "trigger"}
         if self.proprio_temporal_encoder not in valid_temporal:
             raise ValueError(
                 f"`proprio_temporal_encoder` must be one of {valid_temporal}. "
@@ -180,14 +180,38 @@ class ACTConfig(PreTrainedConfig):
                 f"`proprio_fusion_stage` must be one of {valid_fusion}. "
                 f"Got '{self.proprio_fusion_stage}'."
             )
+
+        # Capability matrix: which encoder can feed which fusion stage
+        # embedding = produces a proprio_embedding vector usable by token/film
+        # contact   = produces contact_mask usable by hybrid
+        # history   = needs observation.state_window (K-step history of currents)
+        temporal_caps = {
+            "none":    {"embedding": False, "contact": False, "history": False},
+            "history": {"embedding": False, "contact": False, "history": True},
+            "explicit":{"embedding": True,  "contact": False, "history": False},
+            "cnn":     {"embedding": True,  "contact": False, "history": True},
+            "trigger": {"embedding": True,  "contact": True,  "history": False},
+        }
+        caps = temporal_caps[self.proprio_temporal_encoder]
+
         # Validate temporal+fusion compatibility
         if self.proprio_temporal_encoder == "none" and self.proprio_fusion_stage != "early":
             raise ValueError(
                 "When temporal_encoder='none', fusion_stage must be 'early'."
             )
-        if self.proprio_temporal_encoder == "cnn" and self.proprio_fusion_stage == "film":
-            raise NotImplementedError(
-                "CNN temporal encoder with FiLM fusion is not yet implemented."
+        if self.proprio_fusion_stage in ("token", "film") and not caps["embedding"]:
+            raise ValueError(
+                f"Temporal encoder '{self.proprio_temporal_encoder}' does not produce an embedding, "
+                f"so fusion_stage='{self.proprio_fusion_stage}' is not supported."
+            )
+        if self.proprio_fusion_stage == "hybrid" and not caps["contact"]:
+            raise ValueError(
+                f"Temporal encoder '{self.proprio_temporal_encoder}' does not produce a contact mask, "
+                f"so fusion_stage='hybrid' is not supported."
+            )
+        if caps["history"] and self.proprio_K <= 0:
+            raise ValueError(
+                f"Temporal encoder '{self.proprio_temporal_encoder}' requires proprio_K > 0."
             )
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(

@@ -8,24 +8,12 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Multimodal dataset factory with temporal window support.
-
-This module provides a dataset class that wraps LeRobotDataset with
-temporal window capabilities for training ACT-M variants.
-
-Usage in training config:
-    dataset:
-      _class_: lerobot.datasets.multimodal_dataset.MultimodalDataset
-      repo_id: local/so101-peg-...
-      root: /path/to/dataset
-      temporal_window: 9  # K-step history
-"""
+"""Multimodal dataset factory with temporal window support."""
 
 from pathlib import Path
 from typing import Dict, Optional
 
 import torch
-from datasets import Dataset as HFDataset
 
 from lerobot.datasets import LeRobotDataset
 
@@ -33,42 +21,25 @@ from .temporal_window import TemporalWindowDataset
 
 
 class MultimodalDataset(LeRobotDataset):
-    """Extended dataset with optional temporal window and proprioception views.
-
-    Inherits from LeRobotDataset and adds:
-      - temporal_window: K-step history stacking for state features
-      - view: which state subset to use (act-v, act-m, etc.)
-
-    When temporal_window > 0, each sample's observation.state is concatenated
-    with K past timesteps of the specified state channels.
-    """
+    """Extended dataset with optional temporal window for proprioception."""
 
     def __init__(
         self,
         repo_id: str,
         root: Optional[str | Path] = None,
         temporal_window: int = 0,
-        state_channels: Optional[list] = None,
+        state_window_indices: Optional[list[int]] = None,
         **kwargs,
     ):
-        """Initialize multimodal dataset.
-
-        Args:
-            repo_id: Dataset repository identifier.
-            root: Root directory containing the dataset.
-            temporal_window: K-step history. 0 means no history (default).
-            state_channels: Which state indices to history-stack. None means all.
-            **kwargs: Additional arguments passed to LeRobotDataset.
-        """
         super().__init__(repo_id=repo_id, root=root, **kwargs)
         self.temporal_window = temporal_window
-        self.state_channels = state_channels
+        self.state_window_indices = state_window_indices
 
         if temporal_window > 0:
-            # Wrap with temporal window
             self._windowed = TemporalWindowDataset(
                 base_dataset=self,
                 K=temporal_window,
+                state_indices=state_window_indices,
             )
         else:
             self._windowed = None
