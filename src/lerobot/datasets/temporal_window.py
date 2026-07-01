@@ -69,6 +69,27 @@ class TemporalWindowDataset(Dataset):
         else:
             self._episode_bounds = self._build_episode_bounds_scan()
 
+    # ------------------------------------------------------------------
+    # Attribute passthrough: forward any attribute the training pipeline
+    # expects on a LeRobotDataset (`.meta`, `.num_frames`, `.num_episodes`,
+    # `.episodes`, `.meta.stats`, `.meta.camera_keys`, `.hf_dataset`, ...)
+    # to the wrapped base dataset. Without this, lerobot_train.py raises
+    # AttributeError on `dataset.meta` etc. because this wrapper only
+    # overrides __getitem__/__len__.
+    # ------------------------------------------------------------------
+    def __getattr__(self, name):
+        # __getattr__ is only called when normal lookup fails, so this
+        # safely forwards everything not found on the wrapper itself.
+        # `self.base` is set in __init__ before any external access, but
+        # guard against early-init access (e.g. copy/pickle) to avoid
+        # infinite recursion.
+        if name == "base":
+            raise AttributeError(name)
+        base = self.__dict__.get("base")
+        if base is None:
+            raise AttributeError(name)
+        return getattr(base, name)
+
     def _build_episode_bounds_from_index(self) -> dict:
         idx = self.base.episode_data_index
         bounds = {}
@@ -79,10 +100,16 @@ class TemporalWindowDataset(Dataset):
         return bounds
 
     def _build_episode_bounds_scan(self) -> dict:
+        # Use the parquet-backed tabular layer to avoid per-frame video decodes.
+        try:
+            tabular = self.base.hf_dataset
+        except Exception:
+            tabular = None
         bounds = {}
-        for i in range(len(self.base)):
-            item = self.base[i]
-            ep_idx = int(item[self.episode_key].item())
+        n = len(self.base)
+        for i in range(n):
+            ep_idx = (int(tabular[i][self.episode_key].item()) if tabular is not None
+                       else int(self.base[i][self.episode_key].item()))
             if ep_idx not in bounds:
                 bounds[ep_idx] = [i, i]
             else:
@@ -103,18 +130,34 @@ class TemporalWindowDataset(Dataset):
         indices = self.state_indices if self.state_indices is not None else list(range(n_channels))
 
         window_list = []
+        # Cache the parquet-backed tabular layer so past-state reads do NOT
+        # trigger a video decode. base[idx] decodes the image at idx (~12ms);
+        # base.hf_dataset[idx] reads only the tabular row (~0.03ms, ~400x faster).
+        # We only need past CURRENTS from the state vector, so the image is
+        # discarded work — read the table directly instead.
+        try:
+            tabular = self.base.hf_dataset
+        except Exception:
+            tabular = None  # fall back to full base[idx] if no hf_dataset
+
         for k in range(self.K, -1, -1):  # K, K-1, ..., 0
             past_frame_in_ep = frame_in_ep - k
             if past_frame_in_ep < 0:
+                # Before episode start: zero-pad (matching stat shape)
                 past_state = torch.zeros_like(state)
             else:
                 past_idx = ep_start + past_frame_in_ep
-                past_item = self.base[past_idx]
-                past_ep = int(past_item[self.episode_key].item())
-                if past_ep != current_ep:
-                    past_state = torch.zeros_like(state)
+                if tabular is not None:
+                    # Cheap tabular read; episode boundary already guaranteed
+                    # by past_idx being within [ep_start, ep_end).
+                    past_state = tabular[past_idx][self.state_key]
                 else:
-                    past_state = past_item[self.state_key]
+                    past_item = self.base[past_idx]
+                    past_ep = int(past_item[self.episode_key].item())
+                    if past_ep != current_ep:
+                        past_state = torch.zeros_like(state)
+                    else:
+                        past_state = past_item[self.state_key]
             window_list.append(past_state[..., indices])
 
         item = dict(item)  # shallow copy
