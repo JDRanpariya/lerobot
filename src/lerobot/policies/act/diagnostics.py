@@ -359,12 +359,23 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
                             for h in range(n_heads)]
         overall_proprio = float(np.mean([pl["to_proprio"] for pl in per_layer]))
         overall_vision = float(np.mean([pl["to_vision"] for pl in per_layer]))
+        overall_latent = float(np.mean([pl["to_latent"] for pl in per_layer]))
+        overall_state = float(np.mean([pl["to_state"] for pl in per_layer]))
+        total = overall_latent + overall_state + overall_proprio + overall_vision + 1e-8
 
         result = {
             "n_layers": n_layers, "n_heads": n_heads,
             "proprio_token_index": pidx,
+            # full attention distribution (all four token classes, normalised to ~1)
+            "attention_distribution": {
+                "latent_cls": round(overall_latent / total, 3),
+                "state_pos": round(overall_state / total, 3),
+                "proprio_temporal": round(overall_proprio / total, 3),
+                "vision": round(overall_vision / total, 3),
+            },
             "overall_proprio_mass": overall_proprio,
             "overall_vision_mass": overall_vision,
+            "proprio_vs_vision_ratio": overall_proprio / (overall_vision + 1e-8),
             "overall_proprio_ratio": overall_proprio / (overall_proprio + overall_vision + 1e-8),
             "per_layer": per_layer,
             "per_head_proprio_mass": {f"head{h}": per_head_proprio[h]
