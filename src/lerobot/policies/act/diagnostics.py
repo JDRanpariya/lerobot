@@ -128,15 +128,24 @@ except ImportError:
 class ModalityDiagnostics:
     """Four-tier modality-collapse triangulation suite (ADR-0012). 7 probes."""
 
-    def __init__(self, policy: ACTPolicy, device: str = "cuda",
+    def __init__(self, policy, device: str = "cuda",
                  parquet_path: Optional[Path] = None):
+        # Policy-agnostic: accepts ACTPolicy or DiffusionPolicy.
         self.policy = policy
         self.policy.eval()
         self.device = device
         self.config = policy.config
+        # detect policy family for architecture-specific hookpoints (ADR-0013 D4)
+        self.policy_type = getattr(self.config, "type", "act")
+        self.is_diffusion = (self.policy_type == "diffusion")
+        # current channels: for ACT this is proprio_current_indices (default 6:12);
+        # for DP there is no such field, but the state layout is the same (pos 0:6, cur 6:12)
+        # so we use the same range. For DP-V (act-v view, state dim 6) there are no currents.
         self.current_indices = list(getattr(
             self.config, "proprio_current_indices", list(range(6, 12))))
-        self.chunk_size = int(getattr(self.config, "chunk_size", 100))
+        # chunk/horizon: ACT uses chunk_size, DP uses horizon
+        self.chunk_size = int(getattr(self.config, "chunk_size",
+                                     getattr(self.config, "horizon", 100)))
         self.parquet_path = parquet_path
         # cache manual phase labels (loaded lazily, from parquet)
         self._phase_labels: Optional[List[str]] = None
@@ -175,16 +184,34 @@ class ModalityDiagnostics:
         return "unknown"
 
     # ----- shared zero-out -----
+    def _predict_chunk(self, batch: Dict[str, Tensor]) -> Tensor:
+        """Policy-agnostic action-chunk prediction. ACT uses predict_action_chunk(batch);
+        DP's predict_action_chunk reads queues (ignores batch), so we call
+        diffusion.generate_actions(batch) directly with a (B, n_obs_steps, ...) batch."""
+        if self.is_diffusion:
+            return self.policy.diffusion.generate_actions(batch)
+        return self.policy.predict_action_chunk(batch)
+
     def _zero_out(self, batch: Dict[str, Tensor], which: str) -> Tuple[Tensor, Tensor]:
         with torch.no_grad():
-            af = self.policy.predict_action_chunk(batch)
+            af = self._predict_chunk(batch)
             b = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
+            state_dim = b["observation.state"].shape[-1]
+            # if this is a vision-only model (state_dim <= max(current_indices)), there are
+            # no current channels to zero; zero the FULL state as a no-op control (z_curr ~ 0)
+            if which == "current" and state_dim <= max(self.current_indices):
+                # no proprio channel in this checkpoint (e.g. DP-V vision-only baseline);
+                # return unchanged -> z_curr will be 0, verdict IGNORED trivially (correct:
+                # a vision-only policy has no modality to use)
+                az = af.clone()
+                return af, az
             idx = (self.current_indices if which == "current"
-                   else [i for i in range(b["observation.state"].shape[-1])
+                   else [i for i in range(state_dim)
                          if i not in self.current_indices])
             if "observation.state" in b:
                 s = b["observation.state"].clone(); s[..., idx] = 0.0; b["observation.state"] = s
-            if "observation.state_window" in b:
+            # observation.state_window is ACT-only (temporal encoders); DP has no window
+            if not self.is_diffusion and "observation.state_window" in b:
                 w = b["observation.state_window"].clone()
                 n_cur = len(self.current_indices)
                 kp1 = w.shape[-1] // n_cur
@@ -192,7 +219,7 @@ class ModalityDiagnostics:
                     for k in range(kp1):
                         w[..., k * n_cur:(k + 1) * n_cur] = 0.0
                 b["observation.state_window"] = w
-            az = self.policy.predict_action_chunk(b)
+            az = self._predict_chunk(b)
             return af, az
 
     # ==============================================================
@@ -271,7 +298,15 @@ decompose current-vs-position utilisation. The exposé explicitly allows
 the suite provides (relative_zero_out). This probe activates only for
 token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
         import types
-        fs = self.config.proprio_fusion_stage
+        fs = getattr(self.config, "proprio_fusion_stage", None) if not self.is_diffusion else None
+        if self.is_diffusion:
+            return {"status": "structurally_impossible",
+                    "message": ("Diffusion Policy has no attention matrix; the U-Net "
+                                "conditions on global_cond via FiLM (not self-attention). "
+                                "The suite relies on the ablation-based zero-out probe for "
+                                "DP, which the exposé permits as 'an equivalent "
+                                "ablation-based diagnostic' (ADR-0013 D4)."),
+                    "tier": 2, "probe": "attention_weight_analysis"}
         if fs not in ("token", "hybrid"):
             return {"status": "structurally_impossible",
                     "message": (f"fusion_stage={fs}: current channels are merged into "
@@ -427,6 +462,14 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
                     "probe": "embedding_linear_probe"}
         if dataset is None:
             return {"error": "needs dataset", "tier": 3, "probe": "embedding_linear_probe"}
+        # DP has no proprio token (conditions via global_cond + FiLM); structurally impossible.
+        if self.is_diffusion:
+            return {"status": "structurally_impossible",
+                    "message": ("Diffusion Policy has no proprio token to probe; the U-Net "
+                                "conditions on global_cond (state+vision) via FiLM. The "
+                                "ablation-based zero-out probe is the DP-equivalent diagnostic "
+                                "(ADR-0013 D4)."),
+                    "tier": 3, "probe": "embedding_linear_probe"}
 
         self._load_phase_labels(dataset)
         pidx = _proprio_token_index(self.config.proprio_fusion_stage)
@@ -517,6 +560,19 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
     def gradient_flow_trajectory(self, batch: Dict[str, Tensor]) -> Dict:
         """||grad_current|| / ||grad_position|| on the state-input-projection
         Linear weights, at the final training step."""
+        # DP has no dedicated state-projection Linear; the state is raw-concatenated
+        # into global_cond and each UNet block's cond_encoder Linear mixes proprio
+        # + vision + timestep, so a clean current-vs-position gradient ratio is not
+        # computable. (ADR-0013 D4: structurally transformer-specific in spirit.)
+        if self.is_diffusion:
+            return {"status": "structurally_impossible",
+                    "message": ("Diffusion Policy has no dedicated state-input projection; "
+                                "the state is concatenated into global_cond and the U-Net "
+                                "block cond_encoder Linears mix proprio+vision+timestep, so "
+                                "a clean current-vs-position gradient ratio is not "
+                                "computable. The ablation-based zero-out probe is the "
+                                "DP-equivalent diagnostic (ADR-0013 D4)."),
+                    "tier": 3, "probe": "gradient_flow_trajectory"}
         if "action" not in batch or batch["action"].dim() != 3:
             return {"error": "needs 'action' as (B, chunk_size, act_dim). "
                              "build_batch(include_action=True) assembles it.",
@@ -582,6 +638,17 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
         Calls model() (NOT predict_action_chunk, which runs no_grad)."""
         if dataset is None:
             return {"error": "needs dataset", "tier": 3, "probe": "input_gradient_saliency"}
+        # DP loss-path (diffusion.compute_loss) expects a different batch structure
+        # than the ACT VAE path; saliency adaptation is non-trivial and the probe is
+        # confirmatory (Tier-3). Mark structurally-limited for DP (ADR-0013 D4).
+        if self.is_diffusion:
+            return {"status": "structurally_limited",
+                    "message": ("Diffusion Policy's loss path (diffusion.compute_loss) "
+                                "expects a batch structure incompatible with the ACT-VAE "
+                                "saliency hookpoint; adaptation is non-trivial. The "
+                                "ablation-based zero-out probe is the DP-equivalent "
+                                "diagnostic (ADR-0013 D4)."),
+                    "tier": 3, "probe": "input_gradient_saliency"}
         sal_cur = []; sal_pos = []
         n = len(dataset); step = max(1, n // n_samples)
         self.policy.train()
@@ -624,6 +691,11 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
         High CKA = modalities collapsed to the same representation -> M3/M5."""
         if dataset is None:
             return {"error": "needs dataset", "tier": 3, "probe": "representation_similarity_cka"}
+        # DP branch: CKA between the proprio portion of global_cond and the rgb_encoder output.
+        # DP has no separate proprio/vision tokens; the global_cond concatenates state + img_features.
+        # We hook rgb_encoder to get vision features, and read the proprio from observation.state.
+        if self.is_diffusion:
+            return self._cka_diffusion(dataset, n_samples)
         pidx = _proprio_token_index(self.config.proprio_fusion_stage)
         vidx = pidx + 1
         out_box: Dict[str, Tensor] = {}
@@ -665,6 +737,61 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
         cka = _cka(X, Y)
         return {"cka": cka, "n_samples": len(X),
                 "proprio_token_index": pidx, "vision_token_index": vidx,
+                "tier": 3, "probe": "representation_similarity_cka",
+                "interpretation": "high CKA (>0.8) = modality collapse -> M3/M5"}
+
+    def _cka_diffusion(self, dataset, n_samples: int) -> Dict:
+        """DP-adapted CKA: similarity between the proprio portion of global_cond
+        (the raw current channels) and the rgb_encoder output (vision features).
+        High CKA means the conditioning has collapsed the two modalities together."""
+        out_box: Dict[str, Tensor] = {}
+        def cap(_m, _i, o):
+            out_box["vis"] = o.detach()
+        h = self.policy.diffusion.rgb_encoder.register_forward_hook(cap)
+        proprio_feats: List[np.ndarray] = []; vision_feats: List[np.ndarray] = []
+        n = len(dataset); step = max(1, n // n_samples)
+        try:
+            self.policy.eval()
+            with torch.no_grad():
+                for i in range(0, n, step):
+                    it = dataset[i]
+                    b = {k: (v.unsqueeze(0).to(self.device) if torch.is_tensor(v) else v)
+                         for k, v in it.items()}
+                    # DP expects (B, n_obs_steps, ...) for state; replicate the single frame
+                    if b["observation.state"].dim() == 2:
+                        b["observation.state"] = b["observation.state"].unsqueeze(0)
+                    img = b.get("observation.images.top")
+                    if img is None or img.dim() < 4:
+                        continue
+                    # run the encoder directly on one frame
+                    try:
+                        self.policy.diffusion.rgb_encoder(img if img.dim()==4 else img.unsqueeze(0))
+                        if "vis" in out_box:
+                            vis = out_box["vis"].flatten().cpu().numpy()
+                            # proprio = the current channels from the state
+                            st = b["observation.state"].flatten().cpu().numpy()
+                            cur = st[self.current_indices] if len(st) > max(self.current_indices) else st
+                            # pad/truncate to match vision feat length for CKA (needs same N across samples)
+                            proprio_feats.append(cur[:len(vis)] if len(cur) >= len(vis) else
+                                                 np.pad(cur, (0, len(vis) - len(cur))))
+                            vision_feats.append(vis[:len(proprio_feats[-1])])
+                    except Exception:
+                        continue
+        finally:
+            h.remove()
+        if len(proprio_feats) < 10:
+            return {"error": f"insufficient samples (n={len(proprio_feats)})", "tier": 3,
+                    "probe": "representation_similarity_cka"}
+        X = np.stack(proprio_feats); Y = np.stack(vision_feats)
+        def _cka(A, B):
+            A = A - A.mean(0); B = B - B.mean(0)
+            num = float(np.linalg.norm(A.T @ B) ** 2)
+            den = (float(np.linalg.norm(A.T @ A) ** 2) *
+                   float(np.linalg.norm(B.T @ B) ** 2)) ** 0.5
+            return num / (den + 1e-12)
+        cka = _cka(X, Y)
+        return {"cka": cka, "n_samples": len(X),
+                "note": "DP-adapted: CKA between proprio channels and rgb_encoder output",
                 "tier": 3, "probe": "representation_similarity_cka",
                 "interpretation": "high CKA (>0.8) = modality collapse -> M3/M5"}
 
@@ -729,8 +856,9 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
                attention_figure: Optional[Path] = None) -> Dict:
         """Single entry point. tier1_auc is the Phase-1 value (Ch4), NOT recomputed."""
         rep: Dict = {"checkpoint_variant": {
-            "temporal_encoder": self.config.proprio_temporal_encoder,
-            "fusion_stage": self.config.proprio_fusion_stage,
+            "policy_type": self.policy_type,
+            "temporal_encoder": getattr(self.config, "proprio_temporal_encoder", "none"),
+            "fusion_stage": getattr(self.config, "proprio_fusion_stage", "none"),
         }, "tier1_reference_auc": tier1_auc,
            "tier1_note": "Tier-1 is data-level (Phase-1 / Ch4), not recomputed per checkpoint",
            "n_probes": 7}
