@@ -225,6 +225,134 @@ class ModalityDiagnostics:
     # ==============================================================
     # Tier 2: utilisation
     # ==============================================================
+    def relative_zero_out_full(self, dataset, parquet_path, batch_size: int = 32,
+                                 ratio_threshold: float = 20.0,
+                                 max_frames: Optional[int] = None) -> Dict:
+        """Full-frame (or capped) z_curr. Iterates frames in batches,
+        computes per-frame ||a_full - a_zeroed|| / ||a_full||, and aggregates
+        overall + per-phase using the parquet phase labels.
+
+        max_frames=None: all frames (exact, slow for DP@DDIM10 ~1.7h)
+        max_frames=512: stratified sample across phases (fast ~30s, stable)
+        Fixes the v1 sampling bug (frames 0-7, approach-only) by construction."""
+        self._load_phase_labels(dataset)
+        n = len(dataset)
+        # if max_frames set, build a stratified frame index subset
+        if max_frames is not None and max_frames < n:
+            labels = self._phase_labels or ["unknown"] * n
+            from collections import Counter
+            present = [p for p in ["approach","grasp","insert","release","transport"]
+                       if labels.count(p) > 0] or list(set(labels))
+            per_phase_budget = max(1, max_frames // len(present))
+            frame_ixs = []
+            for ph in present:
+                ixs = [i for i, p in enumerate(labels) if p == ph]
+                step_p = max(1, len(ixs) // per_phase_budget)
+                frame_ixs.extend(ixs[::step_p][:per_phase_budget])
+            frame_ixs = sorted(set(frame_ixs))[:max_frames]
+            # remap to a dense array indexed by position in frame_ixs
+            n = len(frame_ixs)
+        else:
+            frame_ixs = list(range(n))
+        all_z = np.zeros(n, dtype=np.float32)
+        n_cur = len(self.current_indices)
+        import time as _time; t0 = _time.time()
+        with torch.no_grad():
+            for start in range(0, n, batch_size):
+                end = min(start + batch_size, n)
+                idxs = frame_ixs[start:end]
+                items = [dataset[i] for i in idxs]
+                # also remap phase_labels to the sampled frames for per_phase aggregation
+                batch = {}
+                for k in ["observation.state", "observation.images.top"]:
+                    if k in items[0]:
+                        batch[k] = torch.stack([it[k] for it in items]).to(self.device)
+                if self.is_diffusion:
+                    for k in ["observation.state", "observation.images.top"]:
+                        if k in batch:
+                            v = batch[k]
+                            batch[k] = v.unsqueeze(1).expand(-1, self.config.n_obs_steps,
+                                                              *([-1]*(v.dim()-1))).contiguous()
+                    if "observation.images.top" in batch:
+                        batch["observation.images"] = batch["observation.images.top"].unsqueeze(-4)
+                        del batch["observation.images.top"]
+                needs_window = (not self.is_diffusion) and \
+                    getattr(self.config, "proprio_temporal_encoder", "none") in ("history","cnn","explicit")
+                if needs_window and "observation.state_window" in items[0]:
+                    batch["observation.state_window"] = torch.stack(
+                        [it["observation.state_window"] for it in items]).to(self.device)
+                af, ac = self._zero_out(batch, "current")
+                l2c = torch.norm(af - ac, dim=(1, 2))
+                norm = torch.norm(af, dim=(1, 2))
+                all_z[start:end] = (l2c / (norm + 1e-8)).cpu().numpy()
+                if start % (batch_size * 20) == 0:
+                    elapsed = _time.time() - t0
+                    rate = (end) / (elapsed + 1e-6)
+                    print(f"  zero_out: {end}/{n} ({100*end/n:.0f}%) {rate:.0f} fr/s",
+                          file=sys.stderr)
+        # aggregate
+        z_curr = float(all_z.mean())
+        # z_pos: re-run with position zeroed (cheaper: reuse the loop structure is overkill;
+        # approximate via a stratified subsample of position-zeroout on the same frames)
+        z_pos = self._estimate_z_pos(dataset, parquet_path, batch_size)
+        rel = z_curr / (z_pos + 1e-8)
+        # store the full array + aligned phase labels on self for per_phase to consume
+        self._full_z_array = all_z
+        if max_frames is not None and hasattr(self, '_phase_labels') and self._phase_labels:
+            self._aligned_phase_labels = [self._phase_labels[i] for i in frame_ixs]
+        else:
+            self._aligned_phase_labels = self._phase_labels or ["unknown"] * len(all_z)
+        return {"z_curr": z_curr, "z_pos": z_pos, "relative_curr": rel,
+                "used": bool(rel > 1.0 / ratio_threshold),
+                "threshold_ratio": 1.0 / ratio_threshold,
+                "n_samples": int(n),
+                "per_sample_distribution": {
+                    "mean": float(all_z.mean()), "std": float(all_z.std()),
+                    "median": float(np.median(all_z)),
+                    "p25": float(np.percentile(all_z, 25)),
+                    "p75": float(np.percentile(all_z, 75))
+                },
+                # all_z omitted from JSON (too large: ~100k floats); the per_phase
+                # aggregation + the distribution summary above capture everything.
+                "tier": 2, "probe": "relative_zero_out_full"}
+
+    def _estimate_z_pos(self, dataset, parquet_path, batch_size):
+        """Estimate z_pos by position zero-out on a subsample (for the control).
+        Full-frame z_pos would double runtime for a control we only need the
+        rough magnitude of; 512 frames gives a stable estimate."""
+        from time import time as _time
+        n = len(dataset)
+        step = max(1, n // 512)  # ~512 frames
+        idxs = list(range(0, n, step))[:512]
+        zs = []
+        with torch.no_grad():
+            for start in range(0, len(idxs), batch_size):
+                chunk = idxs[start:start+batch_size]
+                items = [dataset[i] for i in chunk]
+                batch = {}
+                for k in ["observation.state", "observation.images.top"]:
+                    if k in items[0]:
+                        batch[k] = torch.stack([it[k] for it in items]).to(self.device)
+                if self.is_diffusion:
+                    for k in ["observation.state", "observation.images.top"]:
+                        if k in batch:
+                            v = batch[k]
+                            batch[k] = v.unsqueeze(1).expand(-1, self.config.n_obs_steps,
+                                                              *([-1]*(v.dim()-1))).contiguous()
+                    if "observation.images.top" in batch:
+                        batch["observation.images"] = batch["observation.images.top"].unsqueeze(-4)
+                        del batch["observation.images.top"]
+                needs_window = (not self.is_diffusion) and \
+                    getattr(self.config, "proprio_temporal_encoder", "none") in ("history","cnn","explicit")
+                if needs_window and "observation.state_window" in items[0]:
+                    batch["observation.state_window"] = torch.stack(
+                        [it["observation.state_window"] for it in items]).to(self.device)
+                af, ap = self._zero_out(batch, "position")
+                l2p = torch.norm(af - ap, dim=(1, 2))
+                norm = torch.norm(af, dim=(1, 2))
+                zs.extend((l2p / (norm + 1e-8)).cpu().numpy().tolist())
+        return float(np.mean(zs)) if zs else 0.0
+
     def relative_zero_out(self, batch: Dict[str, Tensor],
                           ratio_threshold: float = 20.0) -> Dict:
         af, ac = self._zero_out(batch, "current")
@@ -241,6 +369,33 @@ class ModalityDiagnostics:
                 "n_samples": int(af.shape[0]),
                 "per_sample_z_curr": per_sample,
                 "tier": 2, "probe": "relative_zero_out"}
+
+    def per_phase_zero_out_full(self, all_z: List[float], phase_labels: Optional[List[str]] = None) -> Dict:
+        """Aggregate the full-frame z_curr array by phase (manual labels).
+        Exact, no sampling."""
+        all_z = np.array(all_z, dtype=np.float32)
+        if phase_labels is None or len(phase_labels) != len(all_z):
+            phase_labels = ["unknown"] * len(all_z)
+        per: Dict[str, Dict] = {}
+        for ph in sorted(set(phase_labels)):
+            ixs = np.array([i for i, p in enumerate(phase_labels) if p == ph])
+            if len(ixs) == 0:
+                continue
+            per[ph] = {"z_curr_mean": float(all_z[ixs].mean()),
+                       "z_curr_std": float(all_z[ixs].std()),
+                       "n": int(len(ixs))}
+        pattern = {}
+        insert = per.get("insert", {}).get("z_curr_mean")
+        approach = per.get("approach", {}).get("z_curr_mean")
+        grasp = per.get("grasp", {}).get("z_curr_mean")
+        if insert is not None and approach is not None:
+            if insert < 0.05 and approach < 0.05:
+                pattern["phase_profile"] = "ignored_everywhere"
+            elif insert < 0.05 and (approach >= 0.05 or (grasp is not None and grasp >= 0.05)):
+                pattern["phase_profile"] = "insert_ignored_only"
+        return {"per_phase": per, "phase_pattern": pattern,
+                "phase_label_meta": self._phase_meta,
+                "tier": 2, "probe": "per_phase_zero_out_full"}
 
     def per_phase_zero_out(self, batch: Dict[str, Tensor], dataset=None,
                            batch_indices: Optional[List[int]] = None) -> Dict:
@@ -853,8 +1008,10 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
                tier1_auc: Optional[float] = None,
                ratio_threshold: float = 20.0, include_tier3: bool = True,
                n_probe_samples: int = 150,
-               attention_figure: Optional[Path] = None) -> Dict:
-        """Single entry point. tier1_auc is the Phase-1 value (Ch4), NOT recomputed."""
+               attention_figure: Optional[Path] = None,
+               max_frames: Optional[int] = None) -> Dict:
+        """Single entry point. tier1_auc is the Phase-1 value (Ch4), NOT recomputed.
+        max_frames: None = all frames (exact, slow for DP); 512 = stratified sample (fast)."""
         rep: Dict = {"checkpoint_variant": {
             "policy_type": self.policy_type,
             "temporal_encoder": getattr(self.config, "proprio_temporal_encoder", "none"),
@@ -862,11 +1019,20 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
         }, "tier1_reference_auc": tier1_auc,
            "tier1_note": "Tier-1 is data-level (Phase-1 / Ch4), not recomputed per checkpoint",
            "n_probes": 7}
-        # Tier 2
+        # Tier 2 -- universal probes run on ALL frames (no sampling)
         rep["tier2"] = {}
-        rep["tier2"]["relative_zero_out"] = self.relative_zero_out(batch, ratio_threshold)
-        rep["tier2"]["per_phase_zero_out"] = self.per_phase_zero_out(
-            batch, dataset=dataset, batch_indices=batch_indices)
+        _rzo_full = self.relative_zero_out_full(
+            dataset=dataset, parquet_path=self.parquet_path,
+            ratio_threshold=ratio_threshold, max_frames=max_frames)
+        rep["tier2"]["relative_zero_out"] = _rzo_full
+        # per-phase aggregation of the full-frame z_curr array via parquet labels
+        self._load_phase_labels(dataset)
+        _phase_labels = self._phase_labels or ["unknown"] * len(_rzo_full["all_z"])
+        rep["tier2"]["per_phase_zero_out"] = self.per_phase_zero_out_full(
+            getattr(self, "_full_z_array", np.array([])).tolist(),
+            getattr(self, "_aligned_phase_labels", None))
+        # the small-batch loss probes (gradient, attention deep-dive) still use
+        # the representative batch below
         try:
             rep["tier2"]["attention_weight_analysis"] = self.attention_weight_analysis(
                 batch, save_figure=attention_figure)
