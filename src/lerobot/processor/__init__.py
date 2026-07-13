@@ -24,6 +24,7 @@ from lerobot.types import (
 )
 
 from .batch_processor import AddBatchDimensionProcessorStep
+from .current_transform_processor import CurrentTransformProcessorStep
 from .converters import (
     batch_to_transition,
     create_transition,
@@ -152,6 +153,7 @@ __all__ = [
     "LiberoProcessorStep",
     "TimeLimitProcessorStep",
     "AddBatchDimensionProcessorStep",
+    "CurrentTransformProcessorStep",
     "RobotProcessorPipeline",
     "TokenizerProcessorStep",
     "ActionTokenizerProcessorStep",
