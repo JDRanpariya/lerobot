@@ -244,13 +244,19 @@ class ExplicitFeatureEncoder(BaseTemporalEncoder):
             feature_list.append(dI)
 
         if "residual" in self.features:
-            with torch.no_grad():
-                is_free_space = (currents.abs() < self.config.proprio_free_space_threshold).float().mean(dim=-1) > 0.5
-                if is_free_space.any():
-                    mean_free = currents[is_free_space].mean(dim=0)
-                    self.gravity_baseline.mul_(self.baseline_ema_momentum).add_(
-                        mean_free * (1 - self.baseline_ema_momentum)
-                    )
+            # Update the gravity/idle-current baseline EMA ONLY during training. In
+            # eval/inference/diagnostics the buffer must be FROZEN (like BatchNorm
+            # running stats): otherwise every forward mutates it, making predictions
+            # non-deterministic and contaminating ablation diffs (a_full vs a_ablate
+            # are separate forwards). The trained buffer is restored from the checkpoint.
+            if self.training:
+                with torch.no_grad():
+                    is_free_space = (currents.abs() < self.config.proprio_free_space_threshold).float().mean(dim=-1) > 0.5
+                    if is_free_space.any():
+                        mean_free = currents[is_free_space].mean(dim=0)
+                        self.gravity_baseline.mul_(self.baseline_ema_momentum).add_(
+                            mean_free * (1 - self.baseline_ema_momentum)
+                        )
             I_resid = currents - self.gravity_baseline
             feature_list.append(I_resid)
 

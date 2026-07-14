@@ -218,8 +218,17 @@ class ModalityDiagnostics:
             idx = (self.current_indices if which == "current"
                    else [i for i in range(state_dim)
                          if i not in self.current_indices])
+            # Ablate a modality by MEAN-IMPUTATION (per-channel batch mean), not by
+            # setting to literal 0. Inputs are normalized; "0" is the mean only under
+            # MEAN_STD (ACT) but the MIDPOINT under MIN_MAX (DP STATE=MIN_MAX), which
+            # would make DP's baseline non-comparable to ACT's. Batch-mean is the mean
+            # regardless of norm mode -> the ablation removes the modality's discriminative
+            # information consistently across all model types. (Requires batch size > 1,
+            # which every _zero_out caller uses.)
             if "observation.state" in b:
-                s = b["observation.state"].clone(); s[..., idx] = 0.0; b["observation.state"] = s
+                s = b["observation.state"].clone()
+                s[..., idx] = s[..., idx].mean(dim=0, keepdim=True)
+                b["observation.state"] = s
             # observation.state_window is ACT-only (temporal encoders); DP has no window
             if not self.is_diffusion and "observation.state_window" in b:
                 w = b["observation.state_window"].clone()
@@ -227,7 +236,8 @@ class ModalityDiagnostics:
                 kp1 = w.shape[-1] // n_cur
                 if which == "current":
                     for k in range(kp1):
-                        w[..., k * n_cur:(k + 1) * n_cur] = 0.0
+                        sl = slice(k * n_cur, (k + 1) * n_cur)
+                        w[..., sl] = w[..., sl].mean(dim=0, keepdim=True)
                 b["observation.state_window"] = w
             az = self._predict_chunk(b)
             return af, az
