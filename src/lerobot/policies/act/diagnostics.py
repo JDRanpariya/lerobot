@@ -129,7 +129,7 @@ class ModalityDiagnostics:
     """Four-tier modality-collapse triangulation suite (ADR-0012). 7 probes."""
 
     def __init__(self, policy, device: str = "cuda",
-                 parquet_path: Optional[Path] = None):
+                 parquet_path: Optional[Path] = None, preprocessor=None):
         # Policy-agnostic: accepts ACTPolicy or DiffusionPolicy.
         self.policy = policy
         self.policy.eval()
@@ -146,10 +146,20 @@ class ModalityDiagnostics:
         # chunk/horizon: ACT uses chunk_size, DP uses horizon
         self.chunk_size = int(getattr(self.config, "chunk_size",
                                      getattr(self.config, "horizon", 100)))
+        # Offline diagnostics must use the exact checkpoint preprocessor as
         self.parquet_path = parquet_path
         # cache manual phase labels (loaded lazily, from parquet)
         self._phase_labels: Optional[List[str]] = None
         self._phase_meta: Dict = {}
+        # training and deployment (normalization, current transform, image
+        # conversion). It is optional for backwards-compatible unit tests.
+        self.preprocessor = preprocessor
+
+    def _prepare_batch(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        if self.preprocessor is None:
+            return batch
+        return self.preprocessor(batch)
+
 
     # ----- phase labels (manual annotation, parquet-fast) -----
     def _load_phase_labels(self, dataset) -> None:
@@ -281,6 +291,7 @@ class ModalityDiagnostics:
                 if needs_window and "observation.state_window" in items[0]:
                     batch["observation.state_window"] = torch.stack(
                         [it["observation.state_window"] for it in items]).to(self.device)
+                batch = self._prepare_batch(batch)
                 af, ac = self._zero_out(batch, "current")
                 l2c = torch.norm(af - ac, dim=(1, 2))
                 norm = torch.norm(af, dim=(1, 2))
@@ -347,6 +358,7 @@ class ModalityDiagnostics:
                 if needs_window and "observation.state_window" in items[0]:
                     batch["observation.state_window"] = torch.stack(
                         [it["observation.state_window"] for it in items]).to(self.device)
+                batch = self._prepare_batch(batch)
                 af, ap = self._zero_out(batch, "position")
                 l2p = torch.norm(af - ap, dim=(1, 2))
                 norm = torch.norm(af, dim=(1, 2))
@@ -669,6 +681,7 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
                     elbow = float(cur[..., 2].abs().max()) if cur[..., 2].numel() else 0.0
                     lbls.append(int(elbow > 10))
                     try:
+                        b = self._prepare_batch(b)
                         self.policy.predict_action_chunk(b)
                         if "enc" in out_box and out_box["enc"].shape[0] > pidx:
                             feats.append(out_box["enc"][pidx, 0, :].numpy())
@@ -815,6 +828,7 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
             b["action"] = chunk.unsqueeze(0)
             b["action_is_pad"] = torch.zeros(1, self.chunk_size, dtype=torch.bool,
                                              device=self.device)
+            b = self._prepare_batch(b)
             s = b["observation.state"]
             if not s.requires_grad:
                 s.requires_grad_(True)
@@ -869,6 +883,7 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
                     it = dataset[i]
                     b = {k: (v.unsqueeze(0).to(self.device) if torch.is_tensor(v) else v)
                          for k, v in it.items()}
+                    b = self._prepare_batch(b)
                     try:
                         self.policy.predict_action_chunk(b)
                         enc = out_box.get("enc")
@@ -912,6 +927,7 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
                     it = dataset[i]
                     b = {k: (v.unsqueeze(0).to(self.device) if torch.is_tensor(v) else v)
                          for k, v in it.items()}
+                    b = self._prepare_batch(b)
                     # DP expects (B, n_obs_steps, ...) for state; replicate the single frame
                     if b["observation.state"].dim() == 2:
                         b["observation.state"] = b["observation.state"].unsqueeze(0)
@@ -1027,7 +1043,6 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
         rep["tier2"]["relative_zero_out"] = _rzo_full
         # per-phase aggregation of the full-frame z_curr array via parquet labels
         self._load_phase_labels(dataset)
-        _phase_labels = self._phase_labels or ["unknown"] * len(_rzo_full["all_z"])
         rep["tier2"]["per_phase_zero_out"] = self.per_phase_zero_out_full(
             getattr(self, "_full_z_array", np.array([])).tolist(),
             getattr(self, "_aligned_phase_labels", None))

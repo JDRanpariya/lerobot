@@ -54,6 +54,8 @@ class TemporalWindowDataset(Dataset):
         window_key: str = "observation.state_window",
         episode_key: str = "episode_index",
         frame_key: str = "frame_index",
+        normalize_window: bool = True,
+        normalize_eps: float = 1e-8,
     ):
         self.base = base_dataset
         self.K = K
@@ -62,6 +64,21 @@ class TemporalWindowDataset(Dataset):
         self.window_key = window_key
         self.episode_key = episode_key
         self.frame_key = frame_key
+        self.normalize_window = normalize_window
+        self.normalize_eps = normalize_eps
+
+        self._window_mean = None
+        self._window_std = None
+        if self.normalize_window:
+            stats = getattr(getattr(base_dataset, "meta", None), "stats", None)
+            state_stats = stats.get(state_key) if isinstance(stats, dict) else None
+            if not state_stats or "mean" not in state_stats or "std" not in state_stats:
+                raise ValueError(
+                    "TemporalWindowDataset(normalize_window=True) requires "
+                    f"meta.stats[{state_key!r}]['mean'/'std']"
+                )
+            self._window_mean = torch.as_tensor(state_stats["mean"], dtype=torch.float32)
+            self._window_std = torch.as_tensor(state_stats["std"], dtype=torch.float32)
 
         self._episode_bounds = {}
         if hasattr(base_dataset, "episode_data_index"):
@@ -142,9 +159,11 @@ class TemporalWindowDataset(Dataset):
 
         for k in range(self.K, -1, -1):  # K, K-1, ..., 0
             past_frame_in_ep = frame_in_ep - k
+            is_pad = False
             if past_frame_in_ep < 0:
                 # Before episode start: zero-pad (matching stat shape)
                 past_state = torch.zeros_like(state)
+                is_pad = True
             else:
                 past_idx = ep_start + past_frame_in_ep
                 if tabular is not None:
@@ -156,9 +175,20 @@ class TemporalWindowDataset(Dataset):
                     past_ep = int(past_item[self.episode_key].item())
                     if past_ep != current_ep:
                         past_state = torch.zeros_like(state)
+                        is_pad = True
                     else:
                         past_state = past_item[self.state_key]
-            window_list.append(past_state[..., indices])
+            selected = past_state[..., indices]
+            # Normalize REAL past frames into the same MEAN_STD space the policy's
+            # preprocessor puts observation.state in at inference (select_action builds
+            # the window from already-normalized state). Padding is left as raw zero,
+            # which equals the normalized mean (0) -- do NOT normalize it, or a zero
+            # would incorrectly become -mean/std.
+            if self.normalize_window and not is_pad:
+                mean = self._window_mean[indices].to(device=selected.device, dtype=selected.dtype)
+                std = self._window_std[indices].to(device=selected.device, dtype=selected.dtype)
+                selected = (selected - mean) / (std + self.normalize_eps)
+            window_list.append(selected)
 
         item = dict(item)  # shallow copy
         item[self.window_key] = torch.cat(window_list, dim=-1)

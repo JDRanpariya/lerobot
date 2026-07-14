@@ -362,6 +362,37 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             dataset_repo_id=cfg.dataset.repo_id,
         )
 
+    # === THESIS EXTENSION: anti-collapse curricula (config-gated; default OFF) ===
+    # Applied to the NORMALIZED batch each step (in the loop below). FACTR degrades
+    # vision; ProprioDegradation degrades joint position -> both force the policy to
+    # use the weak bus-servo current channel early (SO-101 position->current collapse).
+    # See adaptive_training.py + research/current-attending-fusion-design-2026-07.md.
+    # NOTE: OGM-GE gradient modulation is NOT wired here (it needs per-modality losses);
+    # its config flags are accepted but inert until a modality-isolated loss is added.
+    _pcfg = cfg.policy
+    _factr_curr = None
+    _proprio_curr = None
+    if getattr(_pcfg, "use_factr", False):
+        from lerobot.policies.act.adaptive_training import FACTRCurriculum
+        _factr_curr = FACTRCurriculum(
+            T_decay=int(getattr(_pcfg, "factr_T_decay", 30000)),
+            sigma_max=float(getattr(_pcfg, "factr_sigma_max", 8.0)),
+        )
+    if getattr(_pcfg, "use_proprio_curriculum", False):
+        from lerobot.policies.act.adaptive_training import ProprioDegradationCurriculum
+        _proprio_curr = ProprioDegradationCurriculum(
+            T_decay=int(getattr(_pcfg, "proprio_curriculum_T_decay", 30000)),
+            sigma_max=float(getattr(_pcfg, "proprio_curriculum_sigma_max", 3.0)),
+            current_indices=tuple(getattr(_pcfg, "proprio_current_indices", (6, 7, 8, 9, 10, 11))),
+        )
+    _curr_cam_keys = list(dataset.meta.camera_keys)
+    if (_factr_curr or _proprio_curr) and is_main_process:
+        logging.info(
+            f"Anti-collapse curricula ON: FACTR(vision)={_factr_curr is not None}, "
+            f"ProprioDegradation(position)={_proprio_curr is not None}"
+        )
+    # ===========================================================================
+
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
@@ -461,6 +492,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:
                 batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
         batch = preprocessor(batch)
+        # THESIS: anti-collapse curricula on the normalized batch (config-gated no-op)
+        if _factr_curr is not None:
+            for _ck in _curr_cam_keys:
+                if _ck in batch and torch.is_tensor(batch[_ck]):
+                    batch[_ck] = _factr_curr(batch[_ck], step)
+        if _proprio_curr is not None and "observation.state" in batch:
+            batch["observation.state"] = _proprio_curr(batch["observation.state"], step)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(

@@ -245,7 +245,7 @@ class ExplicitFeatureEncoder(BaseTemporalEncoder):
 
         if "residual" in self.features:
             with torch.no_grad():
-                is_free_space = (currents.abs() < 20).float().mean(dim=-1) > 0.5
+                is_free_space = (currents.abs() < self.config.proprio_free_space_threshold).float().mean(dim=-1) > 0.5
                 if is_free_space.any():
                     mean_free = currents[is_free_space].mean(dim=0)
                     self.gravity_baseline.mul_(self.baseline_ema_momentum).add_(
