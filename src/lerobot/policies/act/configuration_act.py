@@ -147,9 +147,12 @@ class ACTConfig(PreTrainedConfig):
     # Where: at what architectural depth temporal features fuse with vision
     proprio_fusion_stage: str = "early"  # early | token | film | hybrid
 
+    # Thresholds are in normalized observation-state units (after the
+    # checkpoint preprocessor), not raw STS3215 register counts.
     # Contact detection thresholds (for hybrid fusion, Method 4)
-    proprio_contact_threshold_I: float = 50.0
-    proprio_contact_threshold_dI: float = 20.0
+    proprio_contact_threshold_I: float = 2.0
+    proprio_contact_threshold_dI: float = 2.0
+    proprio_free_space_threshold: float = 2.0
     # Gripper position index in state vector for contact detection
     proprio_gripper_idx: int = 5
 
@@ -161,6 +164,15 @@ class ACTConfig(PreTrainedConfig):
     factr_T_decay: int = 30000
     factr_sigma_max: float = 8.0
     use_ogm_ge: bool = False
+    # Position->current collapse axis (SO-101-specific; see
+    # research/current-attending-fusion-design-2026-07.md). Vanilla FACTR degrades
+    # vision to force proprioception; here proprioception (position) is already
+    # dominant and current is ignored, so the curriculum degrades POSITION channels
+    # and the 3-way OGM treats current as its own gradient group.
+    use_proprio_curriculum: bool = False
+    proprio_curriculum_T_decay: int = 30000
+    proprio_curriculum_sigma_max: float = 3.0  # normalized state units
+    ogm_three_way: bool = False                # split vision / position / current
 
     def __post_init__(self):
         super().__post_init__()
