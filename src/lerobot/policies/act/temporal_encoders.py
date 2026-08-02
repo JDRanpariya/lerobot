@@ -183,11 +183,14 @@ class ExplicitFeatureEncoder(BaseTemporalEncoder):
         self.features = config.proprio_explicit_features
         self.K = config.proprio_K
 
-        # Learnable gravity baseline per joint (initialized to zero)
+        # Running gravity/idle-current baseline per joint. This is inference
+        # state, analogous to BatchNorm running statistics, so it must survive
+        # save/load. Older checkpoints omitted it and load with the zero default
+        # under PreTrainedPolicy's backward-compatible strict=False path.
         self.register_buffer(
             "gravity_baseline",
             torch.zeros(self.n_current),
-            persistent=False,
+            persistent=True,
         )
         self.register_buffer(
             "baseline_ema_momentum",
