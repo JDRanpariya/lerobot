@@ -4,7 +4,13 @@ from types import SimpleNamespace
 
 import torch
 
-from lerobot.policies.act.temporal_encoders import ExplicitFeatureEncoder
+from lerobot.policies.act.diagnostics import _needs_history_window
+from lerobot.policies.act.fusion_modules import TokenFusion
+from lerobot.policies.act.temporal_encoders import (
+    ExplicitFeatureEncoder,
+    JointCNNTemporalEncoder,
+    JointTokenEncoder,
+)
 
 
 def test_explicit_encoder_persists_gravity_baseline():
@@ -24,3 +30,88 @@ def test_explicit_encoder_persists_gravity_baseline():
     restored.load_state_dict(state, strict=True)
     torch.testing.assert_close(restored.gravity_baseline, expected)
 
+
+def _joint_config():
+    return SimpleNamespace(
+        proprio_current_indices=[6, 7, 8, 9, 10, 11],
+        proprio_K=9,
+        proprio_cnn_channels=[4, 4, 2],
+        proprio_cnn_kernel_sizes=[3, 3, 3],
+        proprio_cnn_dilations=[1, 2, 4],
+    )
+
+
+def test_joint_token_encoder_preserves_joint_pairing_and_removes_current_bypass():
+    encoder = JointTokenEncoder(_joint_config(), state_dim=12)
+    positions = torch.arange(6, dtype=torch.float32).unsqueeze(0)
+    currents = (10 + torch.arange(6, dtype=torch.float32)).unsqueeze(0)
+
+    output = encoder({"observation.state": torch.cat((positions, currents), dim=-1)})
+
+    assert output["observation.state"].shape == (1, 6)
+    assert output["proprio_embedding"].shape == (1, 6, 2)
+    torch.testing.assert_close(output["observation.state"], positions)
+    torch.testing.assert_close(output["proprio_embedding"][0, :, 0], positions[0])
+    torch.testing.assert_close(output["proprio_embedding"][0, :, 1], currents[0])
+    assert encoder.embedding_tokens() == 6
+
+
+def test_joint_cnn_keeps_histories_isolated_before_attention():
+    encoder = JointCNNTemporalEncoder(_joint_config(), state_dim=12)
+    for module in encoder.cnn:
+        if isinstance(module, torch.nn.Conv1d):
+            torch.nn.init.constant_(module.weight, 0.1)
+            torch.nn.init.constant_(module.bias, 0.1)
+
+    state = torch.zeros(1, 12)
+    baseline_window = torch.zeros(1, 60)
+    changed_window = baseline_window.view(1, 10, 6).clone()
+    changed_window[:, :, 2] = 1.0
+    changed_window = changed_window.reshape(1, 60)
+
+    baseline = encoder(
+        {
+            "observation.state": state,
+            "observation.state_window": baseline_window,
+        }
+    )["proprio_embedding"]
+    changed = encoder(
+        {
+            "observation.state": state,
+            "observation.state_window": changed_window,
+        }
+    )["proprio_embedding"]
+
+    assert changed.shape == (1, 6, 3)
+    torch.testing.assert_close(changed[:, [0, 1, 3, 4, 5]], baseline[:, [0, 1, 3, 4, 5]])
+    assert not torch.equal(changed[:, 2], baseline[:, 2])
+    assert encoder.embedding_tokens() == 6
+
+
+def test_diagnostics_derive_history_requirement_from_encoder_capability():
+    joint_tokens = SimpleNamespace(
+        model=SimpleNamespace(temporal_encoder=JointTokenEncoder(_joint_config(), state_dim=12))
+    )
+    joint_cnn = SimpleNamespace(
+        model=SimpleNamespace(temporal_encoder=JointCNNTemporalEncoder(_joint_config(), state_dim=12))
+    )
+
+    assert not _needs_history_window(joint_tokens)
+    assert _needs_history_window(joint_cnn)
+
+
+def test_token_fusion_exposes_six_addressable_joint_tokens():
+    fusion = TokenFusion(SimpleNamespace(dim_model=8), temporal_dim=2, temporal_tokens=6)
+    temporal = torch.arange(12, dtype=torch.float32).view(1, 6, 2)
+    tokens = fusion(
+        latent=torch.zeros(1, 8),
+        state=torch.zeros(1, 8),
+        vision_tokens=[],
+        temporal_features=temporal,
+    )
+
+    assert len(tokens) == 8  # latent + position state + J1..J6
+    assert fusion.get_extra_pos_embed().shape == (6, 1, 8)
+    for joint_index in range(6):
+        expected = fusion.temporal_proj(temporal[:, joint_index])
+        torch.testing.assert_close(tokens[2 + joint_index], expected)

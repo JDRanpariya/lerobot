@@ -101,7 +101,7 @@ class ACTPolicy(PreTrainedPolicy):
 
         # === THESIS EXTENSION: reset state history buffer ===
         if (
-            self.config.proprio_temporal_encoder in ("history", "cnn", "explicit")
+            self.config.proprio_temporal_encoder in ("history", "cnn", "joint_cnn", "explicit")
             and self.config.proprio_K > 0
         ):
             self._state_history = deque([], maxlen=self.config.proprio_K + 1)
@@ -119,7 +119,7 @@ class ACTPolicy(PreTrainedPolicy):
 
         # === THESIS EXTENSION: maintain state history for temporal encoders ===
         if (
-            self.config.proprio_temporal_encoder in ("history", "cnn", "explicit")
+            self.config.proprio_temporal_encoder in ("history", "cnn", "joint_cnn", "explicit")
             and self.config.proprio_K > 0
         ):
             batch = dict(batch)  # shallow copy
@@ -335,9 +335,7 @@ class ACT(nn.Module):
         # twice -- the actual backbone is constructed further below).
         backbone_out_channels = 0
         if self.config.image_features:
-            backbone_out_channels = getattr(
-                torchvision.models, config.vision_backbone
-            )().fc.in_features
+            backbone_out_channels = getattr(torchvision.models, config.vision_backbone)().fc.in_features
         if self.config.proprio_temporal_encoder != "none" or self.config.proprio_fusion_stage != "early":
             self.temporal_encoder = build_temporal_encoder(
                 config,
@@ -350,6 +348,7 @@ class ACT(nn.Module):
             self.fusion_module = build_fusion_module(
                 config,
                 temporal_dim=self.temporal_encoder.embedding_dim(),
+                temporal_tokens=self.temporal_encoder.embedding_tokens(),
                 backbone_channels=backbone_out_channels or None,
             )
             self.temporal_encoder_state_dim = self.temporal_encoder.output_state_dim()
@@ -401,9 +400,7 @@ class ACT(nn.Module):
         # Transformer encoder input projections. The tokens will be structured like
         # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
         if self.config.robot_state_feature:
-            self.encoder_robot_state_input_proj = nn.Linear(
-                self.temporal_encoder_state_dim, config.dim_model
-            )
+            self.encoder_robot_state_input_proj = nn.Linear(self.temporal_encoder_state_dim, config.dim_model)
         if self.config.env_state_feature:
             self.encoder_env_state_input_proj = nn.Linear(
                 self.config.env_state_feature.shape[0], config.dim_model
@@ -538,16 +535,11 @@ class ACT(nn.Module):
                     cam_features = self.backbone(img)["feature_map"]
 
                     # === THESIS EXTENSION: FiLM conditioning on backbone ===
-                    if (
-                        self.config.proprio_fusion_stage == "film"
-                        and "proprio_embedding" in batch
-                    ):
+                    if self.config.proprio_fusion_stage == "film" and "proprio_embedding" in batch:
                         gamma, beta = self.fusion_module.compute_film_params(
                             batch["proprio_embedding"], cam_features.shape[1]
                         )
-                        cam_features = self.fusion_module.apply_film(
-                            cam_features, gamma, beta
-                        )
+                        cam_features = self.fusion_module.apply_film(cam_features, gamma, beta)
                     # ========================================================
 
                     cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
@@ -586,24 +578,18 @@ class ACT(nn.Module):
             # encoder_1d_feature_pos_embed covers latent + optional state/env only;
             # the temporal token has its own pos embed owned by the fusion module.
             encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
-            # Insert the temporal token's positional embedding (if a temporal
-            # token was actually appended this forward pass).
-            if (
-                temporal_features is not None
-                and hasattr(self.fusion_module, "get_extra_pos_embed")
-            ):
-                extra_pos = self.fusion_module.get_extra_pos_embed().to(
-                    encoder_in_pos_embed[0].dtype
-                )
+            # Insert the temporal token positional embeddings (if temporal
+            # tokens were actually appended this forward pass).
+            if temporal_features is not None and hasattr(self.fusion_module, "get_extra_pos_embed"):
+                extra_pos = self.fusion_module.get_extra_pos_embed().to(encoder_in_pos_embed[0].dtype)
                 # Append after the 1d (latent/state) embeds, before vision.
-                encoder_in_pos_embed.append(extra_pos[0])
+                encoder_in_pos_embed.extend(list(extra_pos))
             # Add camera positional embeddings.
             for cpe in cam_pos_embeds_list:
                 encoder_in_pos_embed.extend(cpe)
             # Sanity check: token / pos-embed counts must match exactly.
             assert len(encoder_in_pos_embed) == len(encoder_in_tokens), (
-                f"pos-embed/token mismatch: {len(encoder_in_pos_embed)} "
-                f"!= {len(encoder_in_tokens)}"
+                f"pos-embed/token mismatch: {len(encoder_in_pos_embed)} != {len(encoder_in_tokens)}"
             )
         else:
             # === ORIGINAL CODE PATH (no temporal/fusion) ===

@@ -136,13 +136,12 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     # wrapper preserves episode boundaries (zero-pad before episode start).
     _enc = getattr(getattr(cfg, "trainable_config", None), "proprio_temporal_encoder", "none")
     _K = getattr(getattr(cfg, "trainable_config", None), "proprio_K", 0)
-    if _enc in ("history", "cnn", "explicit") and _K and _K > 0:
+    if _enc in ("history", "cnn", "joint_cnn", "explicit") and _K and _K > 0:
         try:
             from .temporal_window import TemporalWindowDataset
+
             _cur_idx = getattr(cfg.trainable_config, "proprio_current_indices", None)
-            dataset = TemporalWindowDataset(
-                dataset, K=int(_K), state_indices=_cur_idx
-            )
+            dataset = TemporalWindowDataset(dataset, K=int(_K), state_indices=_cur_idx)
             logging.info(
                 f"Wrapped dataset with TemporalWindowDataset "
                 f"(K={_K}, enc={_enc}, n_current={len(_cur_idx) if _cur_idx is not None else 'all'})"

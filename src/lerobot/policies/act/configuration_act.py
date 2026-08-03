@@ -129,15 +129,19 @@ class ACTConfig(PreTrainedConfig):
 
     # === TEMPORAL ENCODING for proprioceptive signals ===
     # What: how the current time-series is represented before fusion
-    proprio_temporal_encoder: str = "none"  # none | history | explicit | cnn
-    proprio_K: int = 9                      # history window steps (Method 1)
+    # joint_tokens exposes one instantaneous [position, current] token per
+    # joint. joint_cnn exposes one [position, CNN(current history)] token per
+    # joint. Both replace current in the aggregate state token with explicit,
+    # learned joint identities at token fusion.
+    proprio_temporal_encoder: str = "none"  # none | history | explicit | cnn | joint_tokens | joint_cnn
+    proprio_K: int = 9  # history window steps (Method 1)
     # Which state indices contain current channels (for temporal encoders)
     # Default: indices 6-11 in act-m view (position 0-5, current 6-11)
     proprio_current_indices: list[int] = field(default_factory=lambda: [6, 7, 8, 9, 10, 11])
     # Explicit features to compute (Method 2)
-    proprio_explicit_features: list[str] = field(default_factory=lambda: [
-        "raw", "derivative", "residual", "variance", "peak", "power", "impulse"
-    ])
+    proprio_explicit_features: list[str] = field(
+        default_factory=lambda: ["raw", "derivative", "residual", "variance", "peak", "power", "impulse"]
+    )
     # CNN architecture (Method 3)
     proprio_cnn_channels: list[int] = field(default_factory=lambda: [16, 16, 8])
     proprio_cnn_kernel_sizes: list[int] = field(default_factory=lambda: [3, 3, 3])
@@ -172,14 +176,22 @@ class ACTConfig(PreTrainedConfig):
     use_proprio_curriculum: bool = False
     proprio_curriculum_T_decay: int = 30000
     proprio_curriculum_sigma_max: float = 3.0  # normalized state units
-    ogm_three_way: bool = False                # split vision / position / current
+    ogm_three_way: bool = False  # split vision / position / current
 
     def __post_init__(self):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
         # Validate temporal encoder
-        valid_temporal = {"none", "history", "explicit", "cnn", "trigger"}
+        valid_temporal = {
+            "none",
+            "history",
+            "explicit",
+            "cnn",
+            "joint_tokens",
+            "joint_cnn",
+            "trigger",
+        }
         if self.proprio_temporal_encoder not in valid_temporal:
             raise ValueError(
                 f"`proprio_temporal_encoder` must be one of {valid_temporal}. "
@@ -189,8 +201,7 @@ class ACTConfig(PreTrainedConfig):
         valid_fusion = {"early", "token", "film", "hybrid"}
         if self.proprio_fusion_stage not in valid_fusion:
             raise ValueError(
-                f"`proprio_fusion_stage` must be one of {valid_fusion}. "
-                f"Got '{self.proprio_fusion_stage}'."
+                f"`proprio_fusion_stage` must be one of {valid_fusion}. Got '{self.proprio_fusion_stage}'."
             )
 
         # Capability matrix: which encoder can feed which fusion stage
@@ -198,23 +209,31 @@ class ACTConfig(PreTrainedConfig):
         # contact   = produces contact_mask usable by hybrid
         # history   = needs observation.state_window (K-step history of currents)
         temporal_caps = {
-            "none":    {"embedding": False, "contact": False, "history": False},
+            "none": {"embedding": False, "contact": False, "history": False},
             "history": {"embedding": False, "contact": False, "history": True},
-            "explicit":{"embedding": True,  "contact": False, "history": False},
-            "cnn":     {"embedding": True,  "contact": False, "history": True},
-            "trigger": {"embedding": True,  "contact": True,  "history": False},
+            "explicit": {"embedding": True, "contact": False, "history": False},
+            "cnn": {"embedding": True, "contact": False, "history": True},
+            "joint_tokens": {"embedding": True, "contact": False, "history": False},
+            "joint_cnn": {"embedding": True, "contact": False, "history": True},
+            "trigger": {"embedding": True, "contact": True, "history": False},
         }
         caps = temporal_caps[self.proprio_temporal_encoder]
 
         # Validate temporal+fusion compatibility
         if self.proprio_temporal_encoder == "none" and self.proprio_fusion_stage != "early":
-            raise ValueError(
-                "When temporal_encoder='none', fusion_stage must be 'early'."
-            )
+            raise ValueError("When temporal_encoder='none', fusion_stage must be 'early'.")
         if self.proprio_fusion_stage in ("token", "film") and not caps["embedding"]:
             raise ValueError(
                 f"Temporal encoder '{self.proprio_temporal_encoder}' does not produce an embedding, "
                 f"so fusion_stage='{self.proprio_fusion_stage}' is not supported."
+            )
+        if (
+            self.proprio_temporal_encoder in ("joint_tokens", "joint_cnn")
+            and self.proprio_fusion_stage != "token"
+        ):
+            raise ValueError(
+                f"Temporal encoder '{self.proprio_temporal_encoder}' produces "
+                "multiple joint embeddings and therefore requires fusion_stage='token'."
             )
         if self.proprio_fusion_stage == "hybrid" and not caps["contact"]:
             raise ValueError(
@@ -222,9 +241,7 @@ class ACTConfig(PreTrainedConfig):
                 f"so fusion_stage='hybrid' is not supported."
             )
         if caps["history"] and self.proprio_K <= 0:
-            raise ValueError(
-                f"Temporal encoder '{self.proprio_temporal_encoder}' requires proprio_K > 0."
-            )
+            raise ValueError(f"Temporal encoder '{self.proprio_temporal_encoder}' requires proprio_K > 0.")
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."

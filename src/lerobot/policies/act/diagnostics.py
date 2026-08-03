@@ -73,12 +73,12 @@ from .modeling_act import ACTPolicy
 PHASES = ["approach", "grasp", "insert", "release"]
 
 # locate the phase-annotations module (sibling of the lerobot package)
-_ANNOTATION_PATH = (Path(__file__).resolve().parents[5]
-                    / "experiments" / "scripts")
+_ANNOTATION_PATH = Path(__file__).resolve().parents[5] / "experiments" / "scripts"
 if str(_ANNOTATION_PATH) not in sys.path:
     sys.path.insert(0, str(_ANNOTATION_PATH))
 try:
     from phase_annotations import load_phase_labels, proprio_token_index as _pti
+
     _HAS_ANNOTATIONS = True
 except ImportError:
     _HAS_ANNOTATIONS = False
@@ -89,6 +89,26 @@ except ImportError:
 
 def _proprio_token_index(fusion_stage: str) -> int:
     return _pti(fusion_stage)
+
+
+def _proprio_token_indices(policy, fusion_stage: str) -> list[int]:
+    """Return every separately addressable proprioceptive encoder token."""
+    first = _proprio_token_index(fusion_stage)
+    temporal_encoder = getattr(getattr(policy, "model", None), "temporal_encoder", None)
+    count = 1
+    if temporal_encoder is not None and hasattr(temporal_encoder, "embedding_tokens"):
+        count = int(temporal_encoder.embedding_tokens())
+    return list(range(first, first + count))
+
+
+def _needs_history_window(policy) -> bool:
+    """Ask the configured encoder whether it consumes state history."""
+    temporal_encoder = getattr(getattr(policy, "model", None), "temporal_encoder", None)
+    return bool(
+        temporal_encoder is not None
+        and hasattr(temporal_encoder, "has_history_window")
+        and temporal_encoder.has_history_window()
+    )
 
 
 def _build_action_chunk(dataset, idx: int, chunk_size: int) -> Tensor:
@@ -120,6 +140,7 @@ def _build_action_chunk(dataset, idx: int, chunk_size: int) -> Tensor:
 try:
     from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import cross_val_score
+
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -128,8 +149,7 @@ except ImportError:
 class ModalityDiagnostics:
     """Four-tier modality-collapse triangulation suite (ADR-0012). 7 probes."""
 
-    def __init__(self, policy, device: str = "cuda",
-                 parquet_path: Optional[Path] = None, preprocessor=None):
+    def __init__(self, policy, device: str = "cuda", parquet_path: Optional[Path] = None, preprocessor=None):
         # Policy-agnostic: accepts ACTPolicy or DiffusionPolicy.
         self.policy = policy
         self.policy.eval()
@@ -137,15 +157,13 @@ class ModalityDiagnostics:
         self.config = policy.config
         # detect policy family for architecture-specific hookpoints (ADR-0013 D4)
         self.policy_type = getattr(self.config, "type", "act")
-        self.is_diffusion = (self.policy_type == "diffusion")
+        self.is_diffusion = self.policy_type == "diffusion"
         # current channels: for ACT this is proprio_current_indices (default 6:12);
         # for DP there is no such field, but the state layout is the same (pos 0:6, cur 6:12)
         # so we use the same range. For DP-V (act-v view, state dim 6) there are no currents.
-        self.current_indices = list(getattr(
-            self.config, "proprio_current_indices", list(range(6, 12))))
+        self.current_indices = list(getattr(self.config, "proprio_current_indices", list(range(6, 12))))
         # chunk/horizon: ACT uses chunk_size, DP uses horizon
-        self.chunk_size = int(getattr(self.config, "chunk_size",
-                                     getattr(self.config, "horizon", 100)))
+        self.chunk_size = int(getattr(self.config, "chunk_size", getattr(self.config, "horizon", 100)))
         # Offline diagnostics must use the exact checkpoint preprocessor as
         self.parquet_path = parquet_path
         # cache manual phase labels (loaded lazily, from parquet)
@@ -159,7 +177,6 @@ class ModalityDiagnostics:
         if self.preprocessor is None:
             return batch
         return self.preprocessor(batch)
-
 
     # ----- phase labels (manual annotation, parquet-fast) -----
     def _load_phase_labels(self, dataset) -> None:
@@ -215,9 +232,11 @@ class ModalityDiagnostics:
                 # a vision-only policy has no modality to use)
                 az = af.clone()
                 return af, az
-            idx = (self.current_indices if which == "current"
-                   else [i for i in range(state_dim)
-                         if i not in self.current_indices])
+            idx = (
+                self.current_indices
+                if which == "current"
+                else [i for i in range(state_dim) if i not in self.current_indices]
+            )
             # Ablate a modality by MEAN-IMPUTATION (per-channel batch mean), not by
             # setting to literal 0. Inputs are normalized; "0" is the mean only under
             # MEAN_STD (ACT) but the MIDPOINT under MIN_MAX (DP STATE=MIN_MAX), which
@@ -245,9 +264,14 @@ class ModalityDiagnostics:
     # ==============================================================
     # Tier 2: utilisation
     # ==============================================================
-    def relative_zero_out_full(self, dataset, parquet_path, batch_size: int = 32,
-                                 ratio_threshold: float = 20.0,
-                                 max_frames: Optional[int] = None) -> Dict:
+    def relative_zero_out_full(
+        self,
+        dataset,
+        parquet_path,
+        batch_size: int = 32,
+        ratio_threshold: float = 20.0,
+        max_frames: Optional[int] = None,
+    ) -> Dict:
         """Full-frame (or capped) z_curr. Iterates frames in batches,
         computes per-frame ||a_full - a_zeroed|| / ||a_full||, and aggregates
         overall + per-phase using the parquet phase labels.
@@ -261,8 +285,10 @@ class ModalityDiagnostics:
         if max_frames is not None and max_frames < n:
             labels = self._phase_labels or ["unknown"] * n
             from collections import Counter
-            present = [p for p in ["approach","grasp","insert","release","transport"]
-                       if labels.count(p) > 0] or list(set(labels))
+
+            present = [
+                p for p in ["approach", "grasp", "insert", "release", "transport"] if labels.count(p) > 0
+            ] or list(set(labels))
             per_phase_budget = max(1, max_frames // len(present))
             frame_ixs = []
             for ph in present:
@@ -276,7 +302,9 @@ class ModalityDiagnostics:
             frame_ixs = list(range(n))
         all_z = np.zeros(n, dtype=np.float32)
         n_cur = len(self.current_indices)
-        import time as _time; t0 = _time.time()
+        import time as _time
+
+        t0 = _time.time()
         with torch.no_grad():
             for start in range(0, n, batch_size):
                 end = min(start + batch_size, n)
@@ -291,16 +319,19 @@ class ModalityDiagnostics:
                     for k in ["observation.state", "observation.images.top"]:
                         if k in batch:
                             v = batch[k]
-                            batch[k] = v.unsqueeze(1).expand(-1, self.config.n_obs_steps,
-                                                              *([-1]*(v.dim()-1))).contiguous()
+                            batch[k] = (
+                                v.unsqueeze(1)
+                                .expand(-1, self.config.n_obs_steps, *([-1] * (v.dim() - 1)))
+                                .contiguous()
+                            )
                     if "observation.images.top" in batch:
                         batch["observation.images"] = batch["observation.images.top"].unsqueeze(-4)
                         del batch["observation.images.top"]
-                needs_window = (not self.is_diffusion) and \
-                    getattr(self.config, "proprio_temporal_encoder", "none") in ("history","cnn","explicit")
+                needs_window = (not self.is_diffusion) and _needs_history_window(self.policy)
                 if needs_window and "observation.state_window" in items[0]:
                     batch["observation.state_window"] = torch.stack(
-                        [it["observation.state_window"] for it in items]).to(self.device)
+                        [it["observation.state_window"] for it in items]
+                    ).to(self.device)
                 batch = self._prepare_batch(batch)
                 af, ac = self._zero_out(batch, "current")
                 l2c = torch.norm(af - ac, dim=(1, 2))
@@ -309,8 +340,7 @@ class ModalityDiagnostics:
                 if start % (batch_size * 20) == 0:
                     elapsed = _time.time() - t0
                     rate = (end) / (elapsed + 1e-6)
-                    print(f"  zero_out: {end}/{n} ({100*end/n:.0f}%) {rate:.0f} fr/s",
-                          file=sys.stderr)
+                    print(f"  zero_out: {end}/{n} ({100 * end / n:.0f}%) {rate:.0f} fr/s", file=sys.stderr)
         # aggregate
         z_curr = float(all_z.mean())
         # z_pos: re-run with position zeroed (cheaper: reuse the loop structure is overkill;
@@ -319,36 +349,43 @@ class ModalityDiagnostics:
         rel = z_curr / (z_pos + 1e-8)
         # store the full array + aligned phase labels on self for per_phase to consume
         self._full_z_array = all_z
-        if max_frames is not None and hasattr(self, '_phase_labels') and self._phase_labels:
+        if max_frames is not None and hasattr(self, "_phase_labels") and self._phase_labels:
             self._aligned_phase_labels = [self._phase_labels[i] for i in frame_ixs]
         else:
             self._aligned_phase_labels = self._phase_labels or ["unknown"] * len(all_z)
-        return {"z_curr": z_curr, "z_pos": z_pos, "relative_curr": rel,
-                "used": bool(rel > 1.0 / ratio_threshold),
-                "threshold_ratio": 1.0 / ratio_threshold,
-                "n_samples": int(n),
-                "per_sample_distribution": {
-                    "mean": float(all_z.mean()), "std": float(all_z.std()),
-                    "median": float(np.median(all_z)),
-                    "p25": float(np.percentile(all_z, 25)),
-                    "p75": float(np.percentile(all_z, 75))
-                },
-                # all_z omitted from JSON (too large: ~100k floats); the per_phase
-                # aggregation + the distribution summary above capture everything.
-                "tier": 2, "probe": "relative_zero_out_full"}
+        return {
+            "z_curr": z_curr,
+            "z_pos": z_pos,
+            "relative_curr": rel,
+            "used": bool(rel > 1.0 / ratio_threshold),
+            "threshold_ratio": 1.0 / ratio_threshold,
+            "n_samples": int(n),
+            "per_sample_distribution": {
+                "mean": float(all_z.mean()),
+                "std": float(all_z.std()),
+                "median": float(np.median(all_z)),
+                "p25": float(np.percentile(all_z, 25)),
+                "p75": float(np.percentile(all_z, 75)),
+            },
+            # all_z omitted from JSON (too large: ~100k floats); the per_phase
+            # aggregation + the distribution summary above capture everything.
+            "tier": 2,
+            "probe": "relative_zero_out_full",
+        }
 
     def _estimate_z_pos(self, dataset, parquet_path, batch_size):
         """Estimate z_pos by position zero-out on a subsample (for the control).
         Full-frame z_pos would double runtime for a control we only need the
         rough magnitude of; 512 frames gives a stable estimate."""
         from time import time as _time
+
         n = len(dataset)
         step = max(1, n // 512)  # ~512 frames
         idxs = list(range(0, n, step))[:512]
         zs = []
         with torch.no_grad():
             for start in range(0, len(idxs), batch_size):
-                chunk = idxs[start:start+batch_size]
+                chunk = idxs[start : start + batch_size]
                 items = [dataset[i] for i in chunk]
                 batch = {}
                 for k in ["observation.state", "observation.images.top"]:
@@ -358,16 +395,19 @@ class ModalityDiagnostics:
                     for k in ["observation.state", "observation.images.top"]:
                         if k in batch:
                             v = batch[k]
-                            batch[k] = v.unsqueeze(1).expand(-1, self.config.n_obs_steps,
-                                                              *([-1]*(v.dim()-1))).contiguous()
+                            batch[k] = (
+                                v.unsqueeze(1)
+                                .expand(-1, self.config.n_obs_steps, *([-1] * (v.dim() - 1)))
+                                .contiguous()
+                            )
                     if "observation.images.top" in batch:
                         batch["observation.images"] = batch["observation.images.top"].unsqueeze(-4)
                         del batch["observation.images.top"]
-                needs_window = (not self.is_diffusion) and \
-                    getattr(self.config, "proprio_temporal_encoder", "none") in ("history","cnn","explicit")
+                needs_window = (not self.is_diffusion) and _needs_history_window(self.policy)
                 if needs_window and "observation.state_window" in items[0]:
                     batch["observation.state_window"] = torch.stack(
-                        [it["observation.state_window"] for it in items]).to(self.device)
+                        [it["observation.state_window"] for it in items]
+                    ).to(self.device)
                 batch = self._prepare_batch(batch)
                 af, ap = self._zero_out(batch, "position")
                 l2p = torch.norm(af - ap, dim=(1, 2))
@@ -375,22 +415,27 @@ class ModalityDiagnostics:
                 zs.extend((l2p / (norm + 1e-8)).cpu().numpy().tolist())
         return float(np.mean(zs)) if zs else 0.0
 
-    def relative_zero_out(self, batch: Dict[str, Tensor],
-                          ratio_threshold: float = 20.0) -> Dict:
+    def relative_zero_out(self, batch: Dict[str, Tensor], ratio_threshold: float = 20.0) -> Dict:
         af, ac = self._zero_out(batch, "current")
         _, ap = self._zero_out(batch, "position")
-        l2c = torch.norm(af - ac, dim=(1, 2)); l2p = torch.norm(af - ap, dim=(1, 2))
+        l2c = torch.norm(af - ac, dim=(1, 2))
+        l2p = torch.norm(af - ap, dim=(1, 2))
         norm = torch.norm(af, dim=(1, 2))
         z_curr = (l2c.mean() / (norm.mean() + 1e-8)).item()
         z_pos = (l2p.mean() / (norm.mean() + 1e-8)).item()
         rel = z_curr / (z_pos + 1e-8)
         per_sample = (l2c / (norm + 1e-8)).cpu().numpy().tolist()
-        return {"z_curr": z_curr, "z_pos": z_pos, "relative_curr": rel,
-                "used": bool(rel > 1.0 / ratio_threshold),
-                "threshold_ratio": 1.0 / ratio_threshold,
-                "n_samples": int(af.shape[0]),
-                "per_sample_z_curr": per_sample,
-                "tier": 2, "probe": "relative_zero_out"}
+        return {
+            "z_curr": z_curr,
+            "z_pos": z_pos,
+            "relative_curr": rel,
+            "used": bool(rel > 1.0 / ratio_threshold),
+            "threshold_ratio": 1.0 / ratio_threshold,
+            "n_samples": int(af.shape[0]),
+            "per_sample_z_curr": per_sample,
+            "tier": 2,
+            "probe": "relative_zero_out",
+        }
 
     def per_phase_zero_out_full(self, all_z: List[float], phase_labels: Optional[List[str]] = None) -> Dict:
         """Aggregate the full-frame z_curr array by phase (manual labels).
@@ -403,9 +448,11 @@ class ModalityDiagnostics:
             ixs = np.array([i for i, p in enumerate(phase_labels) if p == ph])
             if len(ixs) == 0:
                 continue
-            per[ph] = {"z_curr_mean": float(all_z[ixs].mean()),
-                       "z_curr_std": float(all_z[ixs].std()),
-                       "n": int(len(ixs))}
+            per[ph] = {
+                "z_curr_mean": float(all_z[ixs].mean()),
+                "z_curr_std": float(all_z[ixs].std()),
+                "n": int(len(ixs)),
+            }
         pattern = {}
         insert = per.get("insert", {}).get("z_curr_mean")
         approach = per.get("approach", {}).get("z_curr_mean")
@@ -415,12 +462,17 @@ class ModalityDiagnostics:
                 pattern["phase_profile"] = "ignored_everywhere"
             elif insert < 0.05 and (approach >= 0.05 or (grasp is not None and grasp >= 0.05)):
                 pattern["phase_profile"] = "insert_ignored_only"
-        return {"per_phase": per, "phase_pattern": pattern,
-                "phase_label_meta": self._phase_meta,
-                "tier": 2, "probe": "per_phase_zero_out_full"}
+        return {
+            "per_phase": per,
+            "phase_pattern": pattern,
+            "phase_label_meta": self._phase_meta,
+            "tier": 2,
+            "probe": "per_phase_zero_out_full",
+        }
 
-    def per_phase_zero_out(self, batch: Dict[str, Tensor], dataset=None,
-                           batch_indices: Optional[List[int]] = None) -> Dict:
+    def per_phase_zero_out(
+        self, batch: Dict[str, Tensor], dataset=None, batch_indices: Optional[List[int]] = None
+    ) -> Dict:
         """Per-phase z_curr split, using MANUAL phase labels from phases.csv."""
         af, ac = self._zero_out(batch, "current")
         l2c = torch.norm(af - ac, dim=(1, 2))
@@ -438,8 +490,7 @@ class ModalityDiagnostics:
             ixs = np.array([i for i, p in enumerate(phase_labels) if p == ph])
             if len(ixs) == 0:
                 continue
-            per[ph] = {"z_curr_mean": float(per_sample[ixs].mean()),
-                       "n": int(len(ixs))}
+            per[ph] = {"z_curr_mean": float(per_sample[ixs].mean()), "n": int(len(ixs))}
         pattern = {}
         insert = per.get("insert", {}).get("z_curr_mean")
         approach = per.get("approach", {}).get("z_curr_mean")
@@ -449,51 +500,65 @@ class ModalityDiagnostics:
                 pattern["phase_profile"] = "ignored_everywhere"
             elif insert < 0.05 and (approach >= 0.05 or (grasp is not None and grasp >= 0.05)):
                 pattern["phase_profile"] = "insert_ignored_only"  # -> M4
-        return {"per_phase": per, "phase_pattern": pattern,
-                "phase_label_meta": self._phase_meta,
-                "tier": 2, "probe": "per_phase_zero_out"}
+        return {
+            "per_phase": per,
+            "phase_pattern": pattern,
+            "phase_label_meta": self._phase_meta,
+            "tier": 2,
+            "probe": "per_phase_zero_out",
+        }
 
-    def attention_weight_analysis(self, batch: Dict[str, Tensor],
-                                   save_figure: Optional[Path] = None) -> Dict:
+    def attention_weight_analysis(self, batch: Dict[str, Tensor], save_figure: Optional[Path] = None) -> Dict:
         """Per-layer, per-head attention-weight analysis (the exposé's named
-diagnostic). Returns the full attention distribution, not a single ratio.
+        diagnostic). Returns the full attention distribution, not a single ratio.
 
-SAFETY (verified): the monkey-patch passes `need_weights=True` to
-nn.MultiheadAttention, which ONLY additionally materialises the attention
-weight matrix that the forward pass already computes internally. The
-attn_output (and hence the encoder output) is bit-for-bit identical
-(max abs diff = 0.0 on the actm checkpoint). The patch is applied only
-during this diagnostic, on a loaded checkpoint, in eval mode under
-no_grad, and restored in a finally block. Training, the checkpoint file,
-and all subsequent inference are completely unaffected.
+        SAFETY (verified): the monkey-patch passes `need_weights=True` to
+        nn.MultiheadAttention, which ONLY additionally materialises the attention
+        weight matrix that the forward pass already computes internally. The
+        attn_output (and hence the encoder output) is bit-for-bit identical
+        (max abs diff = 0.0 on the actm checkpoint). The patch is applied only
+        during this diagnostic, on a loaded checkpoint, in eval mode under
+        no_grad, and restored in a finally block. Training, the checkpoint file,
+        and all subsequent inference are completely unaffected.
 
-STRUCTURAL LIMITATION: for early/film fusion the 6 current channels are
-merged into the state token (index 1) before the encoder — there is no
-separate proprio token to attend to, so attention weights cannot
-decompose current-vs-position utilisation. The exposé explicitly allows
-"an equivalent ablation-based diagnostic" (zero-out) for this case, which
-the suite provides (relative_zero_out). This probe activates only for
-token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
+        STRUCTURAL LIMITATION: for early/film fusion the 6 current channels are
+        merged into the state token (index 1) before the encoder — there is no
+        separate proprio token to attend to, so attention weights cannot
+        decompose current-vs-position utilisation. The exposé explicitly allows
+        "an equivalent ablation-based diagnostic" (zero-out) for this case, which
+        the suite provides (relative_zero_out). This probe activates only for
+        token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
         import types
+
         fs = getattr(self.config, "proprio_fusion_stage", None) if not self.is_diffusion else None
         if self.is_diffusion:
-            return {"status": "structurally_impossible",
-                    "message": ("Diffusion Policy has no attention matrix; the U-Net "
-                                "conditions on global_cond via FiLM (not self-attention). "
-                                "The suite relies on the ablation-based zero-out probe for "
-                                "DP, which the exposé permits as 'an equivalent "
-                                "ablation-based diagnostic' (ADR-0013 D4)."),
-                    "tier": 2, "probe": "attention_weight_analysis"}
+            return {
+                "status": "structurally_impossible",
+                "message": (
+                    "Diffusion Policy has no attention matrix; the U-Net "
+                    "conditions on global_cond via FiLM (not self-attention). "
+                    "The suite relies on the ablation-based zero-out probe for "
+                    "DP, which the exposé permits as 'an equivalent "
+                    "ablation-based diagnostic' (ADR-0013 D4)."
+                ),
+                "tier": 2,
+                "probe": "attention_weight_analysis",
+            }
         if fs not in ("token", "hybrid"):
-            return {"status": "structurally_impossible",
-                    "message": (f"fusion_stage={fs}: current channels are merged into "
-                                f"the state token before the encoder; there is no separate "
-                                f"proprio token to attend to. Attention weights cannot "
-                                f"decompose current-vs-position use. The suite relies on "
-                                f"the ablation-based diagnostic (relative_zero_out) for "
-                                f"early/film fusion, which the exposé (line 111) explicitly "
-                                f"permits as 'an equivalent ablation-based diagnostic'."),
-                    "tier": 2, "probe": "attention_weight_analysis"}
+            return {
+                "status": "structurally_impossible",
+                "message": (
+                    f"fusion_stage={fs}: current channels are merged into "
+                    f"the state token before the encoder; there is no separate "
+                    f"proprio token to attend to. Attention weights cannot "
+                    f"decompose current-vs-position use. The suite relies on "
+                    f"the ablation-based diagnostic (relative_zero_out) for "
+                    f"early/film fusion, which the exposé (line 111) explicitly "
+                    f"permits as 'an equivalent ablation-based diagnostic'."
+                ),
+                "tier": 2,
+                "probe": "attention_weight_analysis",
+            }
 
         captured: List[Tensor] = []
         orig_forwards = []
@@ -508,22 +573,29 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
                 if self.pre_norm:
                     x = self.norm1(x)
                 q = k = x if pos_embed is None else x + pos_embed
-                out, attn = self.self_attn(q, k, value=x,
-                                          key_padding_mask=key_padding_mask,
-                                          need_weights=True,
-                                          average_attn_weights=False)
+                out, attn = self.self_attn(
+                    q,
+                    k,
+                    value=x,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=True,
+                    average_attn_weights=False,
+                )
                 captured.append(attn.detach().clone())
                 x = out[0] if isinstance(out, tuple) else out
                 x = skip + self.dropout1(x)
                 if self.pre_norm:
-                    skip = x; x = self.norm2(x)
+                    skip = x
+                    x = self.norm2(x)
                 else:
-                    x = self.norm1(x); skip = x
+                    x = self.norm1(x)
+                    skip = x
                 x = self.linear2(self.dropout(self.activation(self.linear1(x))))
                 x = skip + self.dropout2(x)
                 if not self.pre_norm:
                     x = self.norm2(x)
                 return x
+
             layer.forward = types.MethodType(patched, layer)
 
         try:
@@ -542,42 +614,59 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
                 layer.forward = of
 
         if not captured:
-            return {"error": "no attention weights captured", "tier": 2,
-                    "probe": "attention_weight_analysis"}
+            return {"error": "no attention weights captured", "tier": 2, "probe": "attention_weight_analysis"}
 
-        pidx = _proprio_token_index(fs)
-        # token layout: [latent(0), state(1), temporal(2), vision(3..)]
+        pidxs = _proprio_token_indices(self.policy, fs)
+        vision_start = pidxs[-1] + 1
+        # token layout: [latent(0), state(1), temporal(2..N+1), vision...]
         n_layers = len(captured)
         n_heads = captured[0].shape[1]
         # aggregate: for each layer, mean attention TO the proprio token
         # (averaged over heads and query positions)
         per_layer = []
         for li, attn in enumerate(captured):
-            # attn: (B, H, S, S); attn[..., :, pidx] = attention TO proprio token
-            to_proprio = attn[..., :, pidx].mean().item()
+            # attn: (B, H, S, S); each selected key is one joint token.
+            to_joint = [attn[..., :, pidx].mean().item() for pidx in pidxs]
+            to_proprio = float(sum(to_joint))
             to_latent = attn[..., :, 0].mean().item()
             to_state = attn[..., :, 1].mean().item()
-            to_vision = attn[..., :, 3:].mean().item() if attn.shape[-1] > 3 else 0.0
+            if attn.shape[-1] > vision_start:
+                vision_attention = attn[..., :, vision_start:]
+                # Report probability mass, not mean mass per visual key.  This
+                # keeps one-token and multi-token variants directly comparable.
+                to_vision = vision_attention.sum(dim=-1).mean().item()
+            else:
+                to_vision = 0.0
             # also: how much does the DECODER attend to proprio (the [CLS] query)?
             # encoder self-attn is symmetric; report the mass distribution.
-            per_layer.append({
-                "layer": li, "to_latent": to_latent, "to_state": to_state,
-                "to_proprio": to_proprio, "to_vision": to_vision,
-                "proprio_ratio": to_proprio / (to_proprio + to_vision + 1e-8),
-            })
+            per_layer.append(
+                {
+                    "layer": li,
+                    "to_latent": to_latent,
+                    "to_state": to_state,
+                    "to_proprio": to_proprio,
+                    "to_vision": to_vision,
+                    "to_joint_tokens": {f"J{joint + 1}": mass for joint, mass in enumerate(to_joint)},
+                    "proprio_ratio": to_proprio / (to_proprio + to_vision + 1e-8),
+                }
+            )
         # head-level variation (does any head specialise in proprio?)
         last_layer = captured[-1]  # (B, H, S, S)
-        per_head_proprio = [float(last_layer[0, h, :, pidx].mean())
-                            for h in range(n_heads)]
+        per_head_proprio = [float(last_layer[0, h][:, pidxs].sum(dim=-1).mean()) for h in range(n_heads)]
         overall_proprio = float(np.mean([pl["to_proprio"] for pl in per_layer]))
         overall_vision = float(np.mean([pl["to_vision"] for pl in per_layer]))
         overall_latent = float(np.mean([pl["to_latent"] for pl in per_layer]))
         overall_state = float(np.mean([pl["to_state"] for pl in per_layer]))
+        overall_joint = {
+            f"J{joint + 1}": float(np.mean([pl["to_joint_tokens"][f"J{joint + 1}"] for pl in per_layer]))
+            for joint in range(len(pidxs))
+        }
         total = overall_latent + overall_state + overall_proprio + overall_vision + 1e-8
 
         result = {
-            "n_layers": n_layers, "n_heads": n_heads,
-            "proprio_token_index": pidx,
+            "n_layers": n_layers,
+            "n_heads": n_heads,
+            "proprio_token_indices": pidxs,
             # full attention distribution (all four token classes, normalised to ~1)
             "attention_distribution": {
                 "latent_cls": round(overall_latent / total, 3),
@@ -586,33 +675,41 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
                 "vision": round(overall_vision / total, 3),
             },
             "overall_proprio_mass": overall_proprio,
+            "overall_joint_mass": overall_joint,
             "overall_vision_mass": overall_vision,
             "proprio_vs_vision_ratio": overall_proprio / (overall_vision + 1e-8),
             "overall_proprio_ratio": overall_proprio / (overall_proprio + overall_vision + 1e-8),
             "per_layer": per_layer,
-            "per_head_proprio_mass": {f"head{h}": per_head_proprio[h]
-                                       for h in range(n_heads)},
+            "per_head_proprio_mass": {f"head{h}": per_head_proprio[h] for h in range(n_heads)},
             "max_head_proprio": float(max(per_head_proprio)),
-            "interpretation": ("proprio_ratio < 0.1 with no head specialising "
-                               "=> proprio token is being ignored (M3/M5); "
-                               "one head concentrating > 0.3 => routed but "
-                               "under-amplified (M5 FiLM); "
-                               "overall > 0.2 => actively attended"),
-            "tier": 2, "probe": "attention_weight_analysis",
+            "interpretation": (
+                "proprio_ratio < 0.1 with no head specialising "
+                "=> proprio token is being ignored (M3/M5); "
+                "one head concentrating > 0.3 => routed but "
+                "under-amplified (M5 FiLM); "
+                "overall > 0.2 => actively attended"
+            ),
+            "tier": 2,
+            "probe": "attention_weight_analysis",
         }
         if save_figure is not None:
             try:
                 import matplotlib.pyplot as plt
+
                 fig, axes = plt.subplots(1, 2, figsize=(11, 4))
                 # left: per-layer mass to each token type
                 ll = [pl["layer"] for pl in per_layer]
                 axes[0].plot(ll, [pl["to_latent"] for pl in per_layer], "o-", label="latent")
                 axes[0].plot(ll, [pl["to_state"] for pl in per_layer], "s-", label="state")
-                axes[0].plot(ll, [pl["to_proprio"] for pl in per_layer], "^-", label="proprio (temporal)", color="red")
+                axes[0].plot(
+                    ll, [pl["to_proprio"] for pl in per_layer], "^-", label="proprio (temporal)", color="red"
+                )
                 axes[0].plot(ll, [pl["to_vision"] for pl in per_layer], "d-", label="vision", alpha=0.6)
-                axes[0].set_xlabel("encoder layer"); axes[0].set_ylabel("mean attention mass")
+                axes[0].set_xlabel("encoder layer")
+                axes[0].set_ylabel("mean attention mass")
                 axes[0].set_title("Per-layer attention distribution")
-                axes[0].legend(fontsize=8); axes[0].grid(alpha=0.3)
+                axes[0].legend(fontsize=8)
+                axes[0].grid(alpha=0.3)
                 # right: per-head proprio mass (last layer)
                 axes[1].bar(range(n_heads), per_head_proprio, color="red", alpha=0.7)
                 axes[1].set_xlabel("attention head (last layer)")
@@ -635,21 +732,25 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
         """Linear probe on the POST-ENCODER proprio token (architecture-aware).
         Stratified by manual phase labels so per-phase AUC is real."""
         if not SKLEARN_AVAILABLE:
-            return {"error": "sklearn not installed", "tier": 3,
-                    "probe": "embedding_linear_probe"}
+            return {"error": "sklearn not installed", "tier": 3, "probe": "embedding_linear_probe"}
         if dataset is None:
             return {"error": "needs dataset", "tier": 3, "probe": "embedding_linear_probe"}
         # DP has no proprio token (conditions via global_cond + FiLM); structurally impossible.
         if self.is_diffusion:
-            return {"status": "structurally_impossible",
-                    "message": ("Diffusion Policy has no proprio token to probe; the U-Net "
-                                "conditions on global_cond (state+vision) via FiLM. The "
-                                "ablation-based zero-out probe is the DP-equivalent diagnostic "
-                                "(ADR-0013 D4)."),
-                    "tier": 3, "probe": "embedding_linear_probe"}
+            return {
+                "status": "structurally_impossible",
+                "message": (
+                    "Diffusion Policy has no proprio token to probe; the U-Net "
+                    "conditions on global_cond (state+vision) via FiLM. The "
+                    "ablation-based zero-out probe is the DP-equivalent diagnostic "
+                    "(ADR-0013 D4)."
+                ),
+                "tier": 3,
+                "probe": "embedding_linear_probe",
+            }
 
         self._load_phase_labels(dataset)
-        pidx = _proprio_token_index(self.config.proprio_fusion_stage)
+        pidxs = _proprio_token_indices(self.policy, self.config.proprio_fusion_stage)
         out_box: Dict[str, Tensor] = {}
 
         def cap(_m, _i, o):
@@ -685,16 +786,20 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
             with torch.no_grad():
                 for i in sample_idxs:
                     it = dataset[i]
-                    b = {k: (v.unsqueeze(0).to(self.device) if torch.is_tensor(v) else v)
-                         for k, v in it.items()}
+                    b = {
+                        k: (v.unsqueeze(0).to(self.device) if torch.is_tensor(v) else v)
+                        for k, v in it.items()
+                    }
                     cur = it["observation.state"][..., self.current_indices]
                     elbow = float(cur[..., 2].abs().max()) if cur[..., 2].numel() else 0.0
                     lbls.append(int(elbow > 10))
                     try:
                         b = self._prepare_batch(b)
                         self.policy.predict_action_chunk(b)
-                        if "enc" in out_box and out_box["enc"].shape[0] > pidx:
-                            feats.append(out_box["enc"][pidx, 0, :].numpy())
+                        if "enc" in out_box and out_box["enc"].shape[0] > pidxs[-1]:
+                            # Pool token identity out of this capacity-control
+                            # probe so all variants expose the same feature width.
+                            feats.append(out_box["enc"][pidxs, 0, :].mean(dim=0).numpy())
                             phs.append(self._phase_of_frame(dataset, i))
                     except Exception:
                         continue
@@ -702,10 +807,14 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
             h.remove()
 
         if len(feats) < 10 or len(set(lbls)) < 2:
-            return {"error": f"insufficient 2-class data (n={len(feats)})",
-                    "tier": 3, "probe": "embedding_linear_probe",
-                    "proprio_token_index": pidx}
-        X = np.stack(feats); y = np.array(lbls[:len(feats)])
+            return {
+                "error": f"insufficient 2-class data (n={len(feats)})",
+                "tier": 3,
+                "probe": "embedding_linear_probe",
+                "proprio_token_indices": pidxs,
+            }
+        X = np.stack(feats)
+        y = np.array(lbls[: len(feats)])
         clf = LogisticRegression(max_iter=1000)
         cv = min(5, len(y))
         try:
@@ -713,21 +822,26 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
             acc = float(cross_val_score(clf, X, y, cv=cv, scoring="accuracy").mean())
         except Exception as e:
             return {"error": f"cv failed: {e}", "tier": 3, "probe": "embedding_linear_probe"}
-        res = {"embedding_probe_auc": auc, "embedding_probe_acc": acc,
-               "n_samples": len(y), "proprio_token_index": pidx,
-               "hook": "encoder_output (post-self-attention)",
-               "contact_label_source": "current-threshold pseudo-label (elbow > 10)",
-               "phase_label_meta": self._phase_meta,
-               "tier": 3, "probe": "embedding_linear_probe"}
+        res = {
+            "embedding_probe_auc": auc,
+            "embedding_probe_acc": acc,
+            "n_samples": len(y),
+            "proprio_token_indices": pidxs,
+            "hook": "encoder_output (post-self-attention)",
+            "contact_label_source": "current-threshold pseudo-label (elbow > 10)",
+            "phase_label_meta": self._phase_meta,
+            "tier": 3,
+            "probe": "embedding_linear_probe",
+        }
         # per-phase AUC (real, because stratified)
         per_ph = {}
         for ph in sorted(set(phs)):
             m_ = np.array([p == ph for p in phs])
             if m_.sum() >= 5 and len(np.unique(y[m_])) > 1:
                 try:
-                    a = float(cross_val_score(
-                        clf, X[m_], y[m_], cv=min(3, int(m_.sum())),
-                        scoring="roc_auc").mean())
+                    a = float(
+                        cross_val_score(clf, X[m_], y[m_], cv=min(3, int(m_.sum())), scoring="roc_auc").mean()
+                    )
                     per_ph[ph] = {"auc": a, "n": int(m_.sum())}
                 except Exception:
                     pass
@@ -743,47 +857,94 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
         # + vision + timestep, so a clean current-vs-position gradient ratio is not
         # computable. (ADR-0013 D4: structurally transformer-specific in spirit.)
         if self.is_diffusion:
-            return {"status": "structurally_impossible",
-                    "message": ("Diffusion Policy has no dedicated state-input projection; "
-                                "the state is concatenated into global_cond and the U-Net "
-                                "block cond_encoder Linears mix proprio+vision+timestep, so "
-                                "a clean current-vs-position gradient ratio is not "
-                                "computable. The ablation-based zero-out probe is the "
-                                "DP-equivalent diagnostic (ADR-0013 D4)."),
-                    "tier": 3, "probe": "gradient_flow_trajectory"}
-        if "action" not in batch or batch["action"].dim() != 3:
-            return {"error": "needs 'action' as (B, chunk_size, act_dim). "
-                             "build_batch(include_action=True) assembles it.",
-                    "tier": 3, "probe": "gradient_flow_trajectory"}
-        self.policy.train(); self.policy.zero_grad()
-        loss, _ = self.policy(batch); loss.backward()
-        gc2 = gp2 = 0.0
-        n_cur = len(self.current_indices)
-        for name, p in self.policy.named_parameters():
-            if p.grad is None or p.grad.dim() != 2:
-                continue
-            if (name.endswith("encoder_robot_state_input_proj.weight") or
-                name.endswith("vae_encoder_robot_state_input_proj.weight")):
-                g = p.grad
-                in_dim = g.shape[-1]
-                gp2 += float(g[..., :in_dim - n_cur].norm().item()) ** 2
-                gc2 += float(g[..., in_dim - n_cur:].norm().item()) ** 2
-        self.policy.eval()
-        gc = math.sqrt(gc2); gp = math.sqrt(gp2)
-        return {"grad_current_norm": gc, "grad_position_norm": gp,
-                "ratio": gc / (gp + 1e-8), "tier": 3,
+            return {
+                "status": "structurally_impossible",
+                "message": (
+                    "Diffusion Policy has no dedicated state-input projection; "
+                    "the state is concatenated into global_cond and the U-Net "
+                    "block cond_encoder Linears mix proprio+vision+timestep, so "
+                    "a clean current-vs-position gradient ratio is not "
+                    "computable. The ablation-based zero-out probe is the "
+                    "DP-equivalent diagnostic (ADR-0013 D4)."
+                ),
+                "tier": 3,
                 "probe": "gradient_flow_trajectory",
-                "note": "final-step ratio; trajectory-over-training needs W&B logs"}
+            }
+        if "action" not in batch or batch["action"].dim() != 3:
+            return {
+                "error": "needs 'action' as (B, chunk_size, act_dim). "
+                "build_batch(include_action=True) assembles it.",
+                "tier": 3,
+                "probe": "gradient_flow_trajectory",
+            }
+        self.policy.train()
+        self.policy.zero_grad()
+        loss, _ = self.policy(batch)
+        loss.backward()
+        gc2 = gp2 = 0.0
+        current_encoder2 = 0.0
+        n_cur = len(self.current_indices)
+        temporal_name = getattr(self.config, "proprio_temporal_encoder", "none")
+        joint_selective = temporal_name in ("joint_tokens", "joint_cnn")
+        for name, p in self.policy.named_parameters():
+            if p.grad is None:
+                continue
+            if joint_selective and temporal_name == "joint_cnn" and ".temporal_encoder.cnn." in name:
+                current_encoder2 += float(p.grad.norm().item()) ** 2
+            if p.grad.dim() != 2:
+                continue
+            if joint_selective and name.endswith("fusion_module.temporal_proj.weight"):
+                # Joint token feature layout is [q_j, I_j] or
+                # [q_j, cnn(I_j history)]. Column 0 is position; every
+                # remaining column is current-derived.
+                g = p.grad
+                gp2 += float(g[..., :1].norm().item()) ** 2
+                gc2 += float(g[..., 1:].norm().item()) ** 2
+            elif name.endswith("encoder_robot_state_input_proj.weight") or name.endswith(
+                "vae_encoder_robot_state_input_proj.weight"
+            ):
+                g = p.grad
+                if joint_selective:
+                    # Both aggregate projections receive positions only.
+                    gp2 += float(g.norm().item()) ** 2
+                else:
+                    in_dim = g.shape[-1]
+                    gp2 += float(g[..., : in_dim - n_cur].norm().item()) ** 2
+                    gc2 += float(g[..., in_dim - n_cur :].norm().item()) ** 2
+        self.policy.eval()
+        gc = math.sqrt(gc2)
+        gp = math.sqrt(gp2)
+        return {
+            "grad_current_norm": gc,
+            "grad_position_norm": gp,
+            "ratio": gc / (gp + 1e-8),
+            "tier": 3,
+            "probe": "gradient_flow_trajectory",
+            "current_encoder_grad_norm": math.sqrt(current_encoder2),
+            "route": (
+                "joint-token projection columns: q_j versus current-derived features; "
+                "aggregate and CVAE projections count as position-only"
+                if joint_selective
+                else "aggregate state projection columns"
+            ),
+            "note": (
+                "final-step projection-gradient ratio; the joint-CNN encoder gradient is "
+                "reported separately and trajectory-over-training needs W&B logs"
+            ),
+        }
 
-    def mutual_information(self, parquet_path: Optional[Path] = None,
-                            n_samples: int = 1000) -> Dict:
+    def mutual_information(self, parquet_path: Optional[Path] = None, n_samples: int = 1000) -> Dict:
         """MI between each raw current channel and the contact-vs-free label.
         Reads state from PARQUET (fast)."""
         pq = parquet_path or self.parquet_path
         if pq is None or not Path(pq).exists():
-            return {"error": "needs parquet_path (set in __init__ or pass)", "tier": 3,
-                    "probe": "mutual_information"}
+            return {
+                "error": "needs parquet_path (set in __init__ or pass)",
+                "tier": 3,
+                "probe": "mutual_information",
+            }
         import pandas as pd
+
         df = pd.read_parquet(pq)
         states = np.stack(df["observation.state"].values)
         cur = states[:, self.current_indices]  # (N, 6)
@@ -794,7 +955,8 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
             return {"error": "single-class labels", "tier": 3, "probe": "mutual_information"}
         # subsample
         step = max(1, len(cur) // n_samples)
-        X = cur[::step]; ys = y[::step]
+        X = cur[::step]
+        ys = y[::step]
 
         def _mi_1d(x, yb, n_bins=3):
             x_range = float(np.ptp(x))
@@ -803,13 +965,19 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
             eps = 1e-12
             pxy = np.histogram2d(xb, yb, bins=n_bins)[0] + eps
             pxy /= pxy.sum()
-            px = pxy.sum(1, keepdims=True); py = pxy.sum(0, keepdims=True)
+            px = pxy.sum(1, keepdims=True)
+            py = pxy.sum(0, keepdims=True)
             return float((pxy * np.log(pxy / (px @ py))).sum())
+
         per_ch = [_mi_1d(X[:, j], ys) for j in range(X.shape[1])]
-        return {"per_channel_mi": {f"J{j+1}": per_ch[j] for j in range(len(per_ch))},
-                "total_mi": float(sum(per_ch)), "n_samples": len(ys),
-                "tier": 3, "probe": "mutual_information",
-                "label_source": "current-threshold pseudo-label (elbow > 10)"}
+        return {
+            "per_channel_mi": {f"J{j + 1}": per_ch[j] for j in range(len(per_ch))},
+            "total_mi": float(sum(per_ch)),
+            "n_samples": len(ys),
+            "tier": 3,
+            "probe": "mutual_information",
+            "label_source": "current-threshold pseudo-label (elbow > 10)",
+        }
 
     def input_gradient_saliency(self, dataset=None, n_samples: int = 50) -> Dict:
         """Saliency of current channels on the VAE reconstruction loss.
@@ -820,30 +988,41 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
         # than the ACT VAE path; saliency adaptation is non-trivial and the probe is
         # confirmatory (Tier-3). Mark structurally-limited for DP (ADR-0013 D4).
         if self.is_diffusion:
-            return {"status": "structurally_limited",
-                    "message": ("Diffusion Policy's loss path (diffusion.compute_loss) "
-                                "expects a batch structure incompatible with the ACT-VAE "
-                                "saliency hookpoint; adaptation is non-trivial. The "
-                                "ablation-based zero-out probe is the DP-equivalent "
-                                "diagnostic (ADR-0013 D4)."),
-                    "tier": 3, "probe": "input_gradient_saliency"}
-        sal_cur = []; sal_pos = []
-        n = len(dataset); step = max(1, n // n_samples)
+            return {
+                "status": "structurally_limited",
+                "message": (
+                    "Diffusion Policy's loss path (diffusion.compute_loss) "
+                    "expects a batch structure incompatible with the ACT-VAE "
+                    "saliency hookpoint; adaptation is non-trivial. The "
+                    "ablation-based zero-out probe is the DP-equivalent "
+                    "diagnostic (ADR-0013 D4)."
+                ),
+                "tier": 3,
+                "probe": "input_gradient_saliency",
+            }
+        sal_cur = []
+        sal_pos = []
+        temporal_name = getattr(self.config, "proprio_temporal_encoder", "none")
+        n = len(dataset)
+        step = max(1, n // n_samples)
         self.policy.train()
         for i in range(0, n, step):
             it = dataset[i]
-            b = {k: (v.unsqueeze(0).to(self.device) if torch.is_tensor(v) else v)
-                 for k, v in it.items()}
+            b = {k: (v.unsqueeze(0).to(self.device) if torch.is_tensor(v) else v) for k, v in it.items()}
             chunk = _build_action_chunk(dataset, i, self.chunk_size).to(self.device)
             b["action"] = chunk.unsqueeze(0)
-            b["action_is_pad"] = torch.zeros(1, self.chunk_size, dtype=torch.bool,
-                                             device=self.device)
+            b["action_is_pad"] = torch.zeros(1, self.chunk_size, dtype=torch.bool, device=self.device)
             b = self._prepare_batch(b)
             s = b["observation.state"]
             if not s.requires_grad:
                 s.requires_grad_(True)
             b["observation.state"] = s
+            window = b.get("observation.state_window")
+            if torch.is_tensor(window) and not window.requires_grad:
+                window.requires_grad_(True)
+                b["observation.state_window"] = window
             try:
+                self.policy.zero_grad()
                 with torch.enable_grad():
                     loss, _ = self.policy(b)
                 if loss.grad_fn is None:
@@ -851,19 +1030,37 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
                 loss.backward()
                 if s.grad is not None:
                     g = s.grad[0]
-                    sal_cur.append(float(g[..., self.current_indices].abs().sum()))
                     pos_idx = [j for j in range(s.shape[-1]) if j not in self.current_indices]
-                    sal_pos.append(float(g[..., pos_idx].abs().sum()))
+                    position_grad = g[..., pos_idx].reshape(-1)
+                    current_parts = []
+                    # HistoryStack and JointCNN discard instantaneous current;
+                    # other temporal encoders may use both state and window.
+                    if temporal_name not in ("history", "joint_cnn"):
+                        valid_current = [j for j in self.current_indices if j < s.shape[-1]]
+                        if valid_current:
+                            current_parts.append(g[..., valid_current].reshape(-1))
+                    if torch.is_tensor(window) and window.grad is not None:
+                        current_parts.append(window.grad[0].reshape(-1))
+                    if current_parts and position_grad.numel():
+                        sal_cur.append(float(torch.cat(current_parts).abs().mean()))
+                        sal_pos.append(float(position_grad.abs().mean()))
             except Exception:
                 continue
         self.policy.eval()
         if not sal_cur:
             return {"error": "no saliency captured", "tier": 3, "probe": "input_gradient_saliency"}
-        sc = float(np.mean(sal_cur)); sp = float(np.mean(sal_pos))
-        return {"saliency_current": sc, "saliency_position": sp,
-                "ratio": sc / (sp + 1e-8), "n_samples": len(sal_cur),
-                "tier": 3, "probe": "input_gradient_saliency",
-                "interpretation": "ratio<0.1 with concentrated spatial pattern -> M5 FiLM"}
+        sc = float(np.mean(sal_cur))
+        sp = float(np.mean(sal_pos))
+        return {
+            "saliency_current": sc,
+            "saliency_position": sp,
+            "ratio": sc / (sp + 1e-8),
+            "n_samples": len(sal_cur),
+            "tier": 3,
+            "probe": "input_gradient_saliency",
+            "normalization": "mean absolute gradient per scalar input",
+            "interpretation": "ratio<0.1 with concentrated spatial pattern -> M5 FiLM",
+        }
 
     def representation_similarity_cka(self, dataset=None, n_samples: int = 100) -> Dict:
         """Linear CKA between the proprio and vision post-encoder tokens.
@@ -875,8 +1072,8 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
         # We hook rgb_encoder to get vision features, and read the proprio from observation.state.
         if self.is_diffusion:
             return self._cka_diffusion(dataset, n_samples)
-        pidx = _proprio_token_index(self.config.proprio_fusion_stage)
-        vidx = pidx + 1
+        pidxs = _proprio_token_indices(self.policy, self.config.proprio_fusion_stage)
+        vidx = pidxs[-1] + 1
         out_box: Dict[str, Tensor] = {}
 
         def cap(_m, _i, o):
@@ -884,21 +1081,25 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
             out_box["enc"] = t.detach()
 
         h = self.policy.model.encoder.register_forward_hook(cap)
-        proprio_feats: List[np.ndarray] = []; vision_feats: List[np.ndarray] = []
-        n = len(dataset); step = max(1, n // n_samples)
+        proprio_feats: List[np.ndarray] = []
+        vision_feats: List[np.ndarray] = []
+        n = len(dataset)
+        step = max(1, n // n_samples)
         try:
             self.policy.eval()
             with torch.no_grad():
                 for i in range(0, n, step):
                     it = dataset[i]
-                    b = {k: (v.unsqueeze(0).to(self.device) if torch.is_tensor(v) else v)
-                         for k, v in it.items()}
+                    b = {
+                        k: (v.unsqueeze(0).to(self.device) if torch.is_tensor(v) else v)
+                        for k, v in it.items()
+                    }
                     b = self._prepare_batch(b)
                     try:
                         self.policy.predict_action_chunk(b)
                         enc = out_box.get("enc")
                         if enc is not None and enc.shape[0] > vidx:
-                            proprio_feats.append(enc[pidx, 0, :].cpu().numpy())
+                            proprio_feats.append(enc[pidxs, 0, :].mean(dim=0).cpu().numpy())
                             vision_feats.append(enc[vidx, 0, :].cpu().numpy())
                     except Exception:
                         continue
@@ -906,37 +1107,50 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
             h.remove()
         if len(proprio_feats) < 10:
             return {"error": "insufficient samples", "tier": 3, "probe": "representation_similarity_cka"}
-        X = np.stack(proprio_feats); Y = np.stack(vision_feats)
+        X = np.stack(proprio_feats)
+        Y = np.stack(vision_feats)
 
         def _cka(A, B):
-            A = A - A.mean(0); B = B - B.mean(0)
+            A = A - A.mean(0)
+            B = B - B.mean(0)
             num = float(np.linalg.norm(A.T @ B) ** 2)
-            den = (float(np.linalg.norm(A.T @ A) ** 2) *
-                   float(np.linalg.norm(B.T @ B) ** 2)) ** 0.5
+            den = (float(np.linalg.norm(A.T @ A) ** 2) * float(np.linalg.norm(B.T @ B) ** 2)) ** 0.5
             return num / (den + 1e-12)
+
         cka = _cka(X, Y)
-        return {"cka": cka, "n_samples": len(X),
-                "proprio_token_index": pidx, "vision_token_index": vidx,
-                "tier": 3, "probe": "representation_similarity_cka",
-                "interpretation": "high CKA (>0.8) = modality collapse -> M3/M5"}
+        return {
+            "cka": cka,
+            "n_samples": len(X),
+            "proprio_token_indices": pidxs,
+            "vision_token_index": vidx,
+            "tier": 3,
+            "probe": "representation_similarity_cka",
+            "interpretation": "high CKA (>0.8) = modality collapse -> M3/M5",
+        }
 
     def _cka_diffusion(self, dataset, n_samples: int) -> Dict:
         """DP-adapted CKA: similarity between the proprio portion of global_cond
         (the raw current channels) and the rgb_encoder output (vision features).
         High CKA means the conditioning has collapsed the two modalities together."""
         out_box: Dict[str, Tensor] = {}
+
         def cap(_m, _i, o):
             out_box["vis"] = o.detach()
+
         h = self.policy.diffusion.rgb_encoder.register_forward_hook(cap)
-        proprio_feats: List[np.ndarray] = []; vision_feats: List[np.ndarray] = []
-        n = len(dataset); step = max(1, n // n_samples)
+        proprio_feats: List[np.ndarray] = []
+        vision_feats: List[np.ndarray] = []
+        n = len(dataset)
+        step = max(1, n // n_samples)
         try:
             self.policy.eval()
             with torch.no_grad():
                 for i in range(0, n, step):
                     it = dataset[i]
-                    b = {k: (v.unsqueeze(0).to(self.device) if torch.is_tensor(v) else v)
-                         for k, v in it.items()}
+                    b = {
+                        k: (v.unsqueeze(0).to(self.device) if torch.is_tensor(v) else v)
+                        for k, v in it.items()
+                    }
                     b = self._prepare_batch(b)
                     # DP expects (B, n_obs_steps, ...) for state; replicate the single frame
                     if b["observation.state"].dim() == 2:
@@ -946,50 +1160,69 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
                         continue
                     # run the encoder directly on one frame
                     try:
-                        self.policy.diffusion.rgb_encoder(img if img.dim()==4 else img.unsqueeze(0))
+                        self.policy.diffusion.rgb_encoder(img if img.dim() == 4 else img.unsqueeze(0))
                         if "vis" in out_box:
                             vis = out_box["vis"].flatten().cpu().numpy()
                             # proprio = the current channels from the state
                             st = b["observation.state"].flatten().cpu().numpy()
                             cur = st[self.current_indices] if len(st) > max(self.current_indices) else st
                             # pad/truncate to match vision feat length for CKA (needs same N across samples)
-                            proprio_feats.append(cur[:len(vis)] if len(cur) >= len(vis) else
-                                                 np.pad(cur, (0, len(vis) - len(cur))))
-                            vision_feats.append(vis[:len(proprio_feats[-1])])
+                            proprio_feats.append(
+                                cur[: len(vis)]
+                                if len(cur) >= len(vis)
+                                else np.pad(cur, (0, len(vis) - len(cur)))
+                            )
+                            vision_feats.append(vis[: len(proprio_feats[-1])])
                     except Exception:
                         continue
         finally:
             h.remove()
         if len(proprio_feats) < 10:
-            return {"error": f"insufficient samples (n={len(proprio_feats)})", "tier": 3,
-                    "probe": "representation_similarity_cka"}
-        X = np.stack(proprio_feats); Y = np.stack(vision_feats)
+            return {
+                "error": f"insufficient samples (n={len(proprio_feats)})",
+                "tier": 3,
+                "probe": "representation_similarity_cka",
+            }
+        X = np.stack(proprio_feats)
+        Y = np.stack(vision_feats)
+
         def _cka(A, B):
-            A = A - A.mean(0); B = B - B.mean(0)
+            A = A - A.mean(0)
+            B = B - B.mean(0)
             num = float(np.linalg.norm(A.T @ B) ** 2)
-            den = (float(np.linalg.norm(A.T @ A) ** 2) *
-                   float(np.linalg.norm(B.T @ B) ** 2)) ** 0.5
+            den = (float(np.linalg.norm(A.T @ A) ** 2) * float(np.linalg.norm(B.T @ B) ** 2)) ** 0.5
             return num / (den + 1e-12)
+
         cka = _cka(X, Y)
-        return {"cka": cka, "n_samples": len(X),
-                "note": "DP-adapted: CKA between proprio channels and rgb_encoder output",
-                "tier": 3, "probe": "representation_similarity_cka",
-                "interpretation": "high CKA (>0.8) = modality collapse -> M3/M5"}
+        return {
+            "cka": cka,
+            "n_samples": len(X),
+            "note": "DP-adapted: CKA between proprio channels and rgb_encoder output",
+            "tier": 3,
+            "probe": "representation_similarity_cka",
+            "interpretation": "high CKA (>0.8) = modality collapse -> M3/M5",
+        }
 
     # ==============================================================
     # Tier 4: derived
     # ==============================================================
-    def probe_gap_upper_bound(self, t1_auc: Optional[float],
-                             t3_probe_auc: Optional[float]) -> Dict:
+    def probe_gap_upper_bound(self, t1_auc: Optional[float], t3_probe_auc: Optional[float]) -> Dict:
         if t1_auc is None or t3_probe_auc is None:
-            return {"error": "requires Tier-1 AUC (Phase-1) and Tier-3 embedding probe",
-                    "tier": 4, "probe": "probe_gap_upper_bound"}
-        return {"data_ceiling_auc": t1_auc, "model_ceiling_auc": t3_probe_auc,
-                "recoverable_gap": t1_auc - t3_probe_auc,
-                "interpretation": "small/negative gap => encoder already represents the info; "
-                                  "collapse is routing, not representation (-> M3/M5/M4). "
-                                  "large gap => representation failure (-> M1/M2/M3).",
-                "tier": 4, "probe": "probe_gap_upper_bound"}
+            return {
+                "error": "requires Tier-1 AUC (Phase-1) and Tier-3 embedding probe",
+                "tier": 4,
+                "probe": "probe_gap_upper_bound",
+            }
+        return {
+            "data_ceiling_auc": t1_auc,
+            "model_ceiling_auc": t3_probe_auc,
+            "recoverable_gap": t1_auc - t3_probe_auc,
+            "interpretation": "small/negative gap => encoder already represents the info; "
+            "collapse is routing, not representation (-> M3/M5/M4). "
+            "large gap => representation failure (-> M1/M2/M3).",
+            "tier": 4,
+            "probe": "probe_gap_upper_bound",
+        }
 
     # ==============================================================
     # navigation + report
@@ -998,11 +1231,10 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
         rzo = rep.get("tier2", {}).get("relative_zero_out", {})
         pp = rep.get("tier2", {}).get("per_phase_zero_out", {}).get("phase_pattern", {})
         awa = rep.get("tier2", {}).get("attention_weight_analysis", {})
-        probe_auc = (rep.get("tier3", {}).get("embedding_linear_probe", {})
-                     .get("embedding_probe_auc"))
-        grad = (rep.get("tier3", {}).get("gradient_flow_trajectory", {}).get("ratio"))
-        cka = (rep.get("tier3", {}).get("representation_similarity_cka", {}).get("cka"))
-        saliency = (rep.get("tier3", {}).get("input_gradient_saliency", {}).get("ratio"))
+        probe_auc = rep.get("tier3", {}).get("embedding_linear_probe", {}).get("embedding_probe_auc")
+        grad = rep.get("tier3", {}).get("gradient_flow_trajectory", {}).get("ratio")
+        cka = rep.get("tier3", {}).get("representation_similarity_cka", {}).get("cka")
+        saliency = rep.get("tier3", {}).get("input_gradient_saliency", {}).get("ratio")
         used = rzo.get("used")
         if used:
             return "no collapse", "none (deploy; primary hardware comparison)"
@@ -1029,38 +1261,51 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
             return "signal-too-quiet (saliency concentrated but small)", "M5 FiLM (amplification)"
         return "collapse mechanism undetermined", "run confirmatory probes (saliency/CKA)"
 
-    def report(self, batch: Dict[str, Tensor], dataset=None,
-               batch_indices: Optional[List[int]] = None,
-               tier1_auc: Optional[float] = None,
-               ratio_threshold: float = 20.0, include_tier3: bool = True,
-               n_probe_samples: int = 150,
-               attention_figure: Optional[Path] = None,
-               max_frames: Optional[int] = None) -> Dict:
+    def report(
+        self,
+        batch: Dict[str, Tensor],
+        dataset=None,
+        batch_indices: Optional[List[int]] = None,
+        tier1_auc: Optional[float] = None,
+        ratio_threshold: float = 20.0,
+        include_tier3: bool = True,
+        n_probe_samples: int = 150,
+        attention_figure: Optional[Path] = None,
+        max_frames: Optional[int] = None,
+    ) -> Dict:
         """Single entry point. tier1_auc is the Phase-1 value (Ch4), NOT recomputed.
         max_frames: None = all frames (exact, slow for DP); 512 = stratified sample (fast)."""
-        rep: Dict = {"checkpoint_variant": {
-            "policy_type": self.policy_type,
-            "temporal_encoder": getattr(self.config, "proprio_temporal_encoder", "none"),
-            "fusion_stage": getattr(self.config, "proprio_fusion_stage", "none"),
-        }, "tier1_reference_auc": tier1_auc,
-           "tier1_note": "Tier-1 is data-level (Phase-1 / Ch4), not recomputed per checkpoint",
-           "n_probes": 7}
+        rep: Dict = {
+            "checkpoint_variant": {
+                "policy_type": self.policy_type,
+                "temporal_encoder": getattr(self.config, "proprio_temporal_encoder", "none"),
+                "fusion_stage": getattr(self.config, "proprio_fusion_stage", "none"),
+            },
+            "tier1_reference_auc": tier1_auc,
+            "tier1_note": "Tier-1 is data-level (Phase-1 / Ch4), not recomputed per checkpoint",
+            "n_probes": 7,
+        }
         # Tier 2 -- universal probes run on ALL frames (no sampling)
         rep["tier2"] = {}
         _rzo_full = self.relative_zero_out_full(
-            dataset=dataset, parquet_path=self.parquet_path,
-            ratio_threshold=ratio_threshold, max_frames=max_frames)
+            dataset=dataset,
+            parquet_path=self.parquet_path,
+            ratio_threshold=ratio_threshold,
+            max_frames=max_frames,
+        )
         rep["tier2"]["relative_zero_out"] = _rzo_full
         # per-phase aggregation of the full-frame z_curr array via parquet labels
         self._load_phase_labels(dataset)
         rep["tier2"]["per_phase_zero_out"] = self.per_phase_zero_out_full(
             getattr(self, "_full_z_array", np.array([])).tolist(),
-            getattr(self, "_aligned_phase_labels", None))
+            getattr(self, "_aligned_phase_labels", None),
+        )
         # the small-batch loss probes (gradient, attention deep-dive) still use
         # the representative batch below
         try:
             rep["tier2"]["attention_weight_analysis"] = self.attention_weight_analysis(
-                batch, save_figure=attention_figure)
+                batch, save_figure=attention_figure
+            )
         except Exception as e:
             rep["tier2"]["attention_weight_analysis"] = {"error": str(e)}
         # Tier 3
@@ -1068,7 +1313,8 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
             rep["tier3"] = {}
             try:
                 rep["tier3"]["embedding_linear_probe"] = self.embedding_linear_probe(
-                    dataset=dataset, n_samples=n_probe_samples)
+                    dataset=dataset, n_samples=n_probe_samples
+                )
             except Exception as e:
                 rep["tier3"]["embedding_linear_probe"] = {"error": str(e)}
             try:
@@ -1078,22 +1324,24 @@ token/hybrid fusion (M3/M4), where proprio enters as a separate token."""
             if dataset is not None and self.parquet_path is not None:
                 try:
                     rep["tier3"]["mutual_information"] = self.mutual_information(
-                        parquet_path=self.parquet_path)
+                        parquet_path=self.parquet_path
+                    )
                 except Exception as e:
                     rep["tier3"]["mutual_information"] = {"error": str(e)}
             try:
                 rep["tier3"]["input_gradient_saliency"] = self.input_gradient_saliency(
-                    dataset=dataset, n_samples=50)
+                    dataset=dataset, n_samples=50
+                )
             except Exception as e:
                 rep["tier3"]["input_gradient_saliency"] = {"error": str(e)}
             try:
                 rep["tier3"]["representation_similarity_cka"] = self.representation_similarity_cka(
-                    dataset=dataset, n_samples=100)
+                    dataset=dataset, n_samples=100
+                )
             except Exception as e:
                 rep["tier3"]["representation_similarity_cka"] = {"error": str(e)}
         # Tier 4
-        t3_auc = ((rep.get("tier3", {}).get("embedding_linear_probe") or {})
-                  .get("embedding_probe_auc"))
+        t3_auc = (rep.get("tier3", {}).get("embedding_linear_probe") or {}).get("embedding_probe_auc")
         rep["tier4"] = {}
         try:
             rep["tier4"]["probe_gap_upper_bound"] = self.probe_gap_upper_bound(tier1_auc, t3_auc)

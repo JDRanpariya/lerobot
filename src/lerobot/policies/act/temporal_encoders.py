@@ -38,11 +38,13 @@ from .configuration_act import ACTConfig
 
 # Encoder capability matrix used by ACTConfig validation and ACT.__init__
 TEMPORAL_ENCODER_CAPS = {
-    "none":     {"embedding": False, "contact": False, "history": False},
-    "history":  {"embedding": False, "contact": False, "history": True},
-    "explicit": {"embedding": True,  "contact": False, "history": False},
-    "cnn":      {"embedding": True,  "contact": False, "history": True},
-    "trigger":  {"embedding": True,  "contact": True,  "history": False},
+    "none": {"embedding": False, "contact": False, "history": False},
+    "history": {"embedding": False, "contact": False, "history": True},
+    "explicit": {"embedding": True, "contact": False, "history": False},
+    "cnn": {"embedding": True, "contact": False, "history": True},
+    "joint_tokens": {"embedding": True, "contact": False, "history": False},
+    "joint_cnn": {"embedding": True, "contact": False, "history": True},
+    "trigger": {"embedding": True, "contact": True, "history": False},
 }
 
 
@@ -97,6 +99,10 @@ class BaseTemporalEncoder(nn.Module):
         construction time) so the optimizer can see those parameters.
         """
         return None
+
+    def embedding_tokens(self) -> int:
+        """Number of separately addressable tokens in the embedding."""
+        return 1
 
     def forward(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
         raise NotImplementedError
@@ -230,9 +236,11 @@ class ExplicitFeatureEncoder(BaseTemporalEncoder):
                 w = window.view(B, -1, self.n_current)
                 dI = _central_diff(w.transpose(-1, -2), self._dt).transpose(-1, -2)
                 dI = dI[..., -1, :]  # present derivative
-                dq = _central_diff(
-                    positions.unsqueeze(-1).transpose(-1, -2), self._dt
-                ).transpose(-1, -2).squeeze(-2)
+                dq = (
+                    _central_diff(positions.unsqueeze(-1).transpose(-1, -2), self._dt)
+                    .transpose(-1, -2)
+                    .squeeze(-2)
+                )
             else:
                 dI = torch.zeros_like(currents)
                 dq = torch.zeros_like(positions)
@@ -254,7 +262,9 @@ class ExplicitFeatureEncoder(BaseTemporalEncoder):
             # are separate forwards). The trained buffer is restored from the checkpoint.
             if self.training:
                 with torch.no_grad():
-                    is_free_space = (currents.abs() < self.config.proprio_free_space_threshold).float().mean(dim=-1) > 0.5
+                    is_free_space = (currents.abs() < self.config.proprio_free_space_threshold).float().mean(
+                        dim=-1
+                    ) > 0.5
                     if is_free_space.any():
                         mean_free = currents[is_free_space].mean(dim=0)
                         self.gravity_baseline.mul_(self.baseline_ema_momentum).add_(
@@ -316,10 +326,12 @@ class CNNTemporalEncoder(BaseTemporalEncoder):
         in_ch = self.n_current
         for out_ch, k, d in zip(channels, kernels, dilations):
             pad = (k - 1) * d // 2
-            layers.extend([
-                nn.Conv1d(in_ch, out_ch, kernel_size=k, dilation=d, padding=pad),
-                nn.ReLU(inplace=True),
-            ])
+            layers.extend(
+                [
+                    nn.Conv1d(in_ch, out_ch, kernel_size=k, dilation=d, padding=pad),
+                    nn.ReLU(inplace=True),
+                ]
+            )
             in_ch = out_ch
         self.cnn = nn.Sequential(*layers)
         self.global_pool = nn.AdaptiveAvgPool1d(1)
@@ -358,6 +370,128 @@ class CNNTemporalEncoder(BaseTemporalEncoder):
 
         batch = dict(batch)
         batch["proprio_embedding"] = embedding
+        return batch
+
+
+class JointTokenEncoder(BaseTemporalEncoder):
+    """One instantaneous [position, current] embedding per physical joint.
+
+    The aggregate state is reduced to positions so current has no hidden
+    bypass around the six explicit joint tokens. The shared token projection
+    and learned joint identities live in TokenFusion.
+    """
+
+    def __init__(self, config: ACTConfig, state_dim: int):
+        super().__init__(config, state_dim)
+        if self.n_position != self.n_current:
+            raise ValueError(
+                "JointTokenEncoder requires one position per current channel; "
+                f"got {self.n_position} positions and {self.n_current} currents."
+            )
+
+    def output_state_dim(self) -> int:
+        return self.n_position
+
+    def produces_embedding(self) -> bool:
+        return True
+
+    def embedding_dim(self) -> int:
+        return 2
+
+    def embedding_tokens(self) -> int:
+        return self.n_current
+
+    def forward(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        batch = dict(batch)
+        state = batch["observation.state"]
+        positions = self._get_positions(state)
+        currents = self._get_currents(state)
+        batch["observation.state"] = positions
+        batch["proprio_embedding"] = torch.stack((positions, currents), dim=-1)
+        return batch
+
+
+class JointCNNTemporalEncoder(BaseTemporalEncoder):
+    """One shared-CNN current-history embedding per physical joint.
+
+    Each output token contains the joint's current position and its own current
+    history summary. Histories never mix across joints before Transformer
+    attention; TokenFusion supplies learned joint identities.
+    """
+
+    def __init__(self, config: ACTConfig, state_dim: int):
+        super().__init__(config, state_dim)
+        if self.n_position != self.n_current:
+            raise ValueError(
+                "JointCNNTemporalEncoder requires one position per current channel; "
+                f"got {self.n_position} positions and {self.n_current} currents."
+            )
+        self.K = config.proprio_K
+        channels = config.proprio_cnn_channels
+        kernels = config.proprio_cnn_kernel_sizes
+        dilations = config.proprio_cnn_dilations
+
+        layers = []
+        in_ch = 1
+        for out_ch, kernel, dilation in zip(channels, kernels, dilations, strict=True):
+            padding = (kernel - 1) * dilation // 2
+            layers.extend(
+                [
+                    nn.Conv1d(
+                        in_ch,
+                        out_ch,
+                        kernel_size=kernel,
+                        dilation=dilation,
+                        padding=padding,
+                    ),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+            in_ch = out_ch
+        self.cnn = nn.Sequential(*layers)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        self.out_dim = channels[-1]
+
+    def output_state_dim(self) -> int:
+        return self.n_position
+
+    def has_history_window(self) -> bool:
+        return True
+
+    def produces_embedding(self) -> bool:
+        return True
+
+    def embedding_dim(self) -> int:
+        return self.out_dim + 1
+
+    def embedding_tokens(self) -> int:
+        return self.n_current
+
+    def forward(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        window = self._get_state_window(batch)
+        if window is None:
+            raise KeyError(
+                "JointCNNTemporalEncoder requires 'observation.state_window'. "
+                "Use TemporalWindowDataset or equivalent."
+            )
+        expected = (self.K + 1) * self.n_current
+        if window.shape[-1] != expected:
+            raise ValueError(
+                f"JointCNNTemporalEncoder expected state_window dim {expected}, got {window.shape[-1]}"
+            )
+
+        batch = dict(batch)
+        state = batch["observation.state"]
+        positions = self._get_positions(state)
+        batch_size = window.shape[0]
+        histories = window.view(batch_size, self.K + 1, self.n_current)
+        histories = histories.transpose(1, 2).reshape(batch_size * self.n_current, 1, self.K + 1)
+        features = self.cnn(histories)
+        summaries = self.global_pool(features).squeeze(-1)
+        summaries = summaries.view(batch_size, self.n_current, self.out_dim)
+
+        batch["observation.state"] = positions
+        batch["proprio_embedding"] = torch.cat((positions.unsqueeze(-1), summaries), dim=-1)
         return batch
 
 
@@ -420,6 +554,8 @@ TEMPORAL_ENCODERS = {
     "history": HistoryStackEncoder,
     "explicit": ExplicitFeatureEncoder,
     "cnn": CNNTemporalEncoder,
+    "joint_tokens": JointTokenEncoder,
+    "joint_cnn": JointCNNTemporalEncoder,
     "trigger": TriggerEncoder,
 }
 
@@ -428,7 +564,5 @@ def build_temporal_encoder(config: ACTConfig, state_dim: int) -> BaseTemporalEnc
     """Factory function to instantiate the correct temporal encoder."""
     name = config.proprio_temporal_encoder
     if name not in TEMPORAL_ENCODERS:
-        raise ValueError(
-            f"Unknown temporal encoder '{name}'. Available: {list(TEMPORAL_ENCODERS.keys())}"
-        )
+        raise ValueError(f"Unknown temporal encoder '{name}'. Available: {list(TEMPORAL_ENCODERS.keys())}")
     return TEMPORAL_ENCODERS[name](config, state_dim)

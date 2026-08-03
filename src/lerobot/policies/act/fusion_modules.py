@@ -55,18 +55,20 @@ class BaseFusionModule(nn.Module):
         self,
         config: ACTConfig,
         temporal_dim: int | None = None,
+        temporal_tokens: int = 1,
         backbone_channels: int | None = None,
     ):
         super().__init__()
         self.config = config
         self.dim_model = config.dim_model
         self.temporal_dim = temporal_dim
+        self.temporal_tokens = temporal_tokens
         self.backbone_channels = backbone_channels
 
     def forward(
         self,
         latent: Tensor,  # (B, dim_model)
-        state: Tensor,   # (B, dim_model)
+        state: Tensor,  # (B, dim_model)
         vision_tokens: List[Tensor],  # each (B, dim_model)
         temporal_features: Tensor | None = None,  # (B, temporal_dim)
         contact_mask: Tensor | None = None,  # (B,)
@@ -91,7 +93,7 @@ class EarlyFusion(BaseFusionModule):
 
 
 class TokenFusion(BaseFusionModule):
-    """F1: Intermediate fusion — temporal embedding as a separate token."""
+    """F1: Intermediate fusion with one or more addressable tokens."""
 
     def __init__(self, config: ACTConfig, temporal_dim: int | None = None, **kwargs):
         super().__init__(config, temporal_dim=temporal_dim, **kwargs)
@@ -102,21 +104,33 @@ class TokenFusion(BaseFusionModule):
                 "The temporal encoder must expose embedding_dim()."
             )
         self.temporal_proj = nn.Linear(self.temporal_dim, self.dim_model)
-        self.temporal_pos_embed = nn.Embedding(1, self.dim_model)
+        self.temporal_pos_embed = nn.Embedding(self.temporal_tokens, self.dim_model)
 
     def forward(self, latent, state, vision_tokens, temporal_features=None, **kwargs):
         tokens = [latent, state]
         if temporal_features is not None:
-            temporal_token = self.temporal_proj(temporal_features)  # (B, dim_model)
-            tokens.append(temporal_token)
+            if temporal_features.ndim == 2:
+                temporal_features = temporal_features.unsqueeze(1)
+            if temporal_features.ndim != 3:
+                raise ValueError(
+                    "TokenFusion expects temporal features shaped (B,D) or "
+                    f"(B,N,D), got {tuple(temporal_features.shape)}."
+                )
+            if temporal_features.shape[1] != self.temporal_tokens:
+                raise ValueError(
+                    f"TokenFusion was built for {self.temporal_tokens} temporal "
+                    f"tokens but received {temporal_features.shape[1]}."
+                )
+            temporal_tokens = self.temporal_proj(temporal_features)
+            tokens.extend(temporal_tokens.unbind(dim=1))
         tokens.extend(vision_tokens)
         return tokens
 
     def n_non_vision_tokens(self) -> int:
-        return 3
+        return 2 + self.temporal_tokens
 
     def get_extra_pos_embed(self) -> Tensor:
-        return self.temporal_pos_embed.weight.unsqueeze(1)  # (1, 1, dim_model)
+        return self.temporal_pos_embed.weight.unsqueeze(1)
 
 
 class FiLMFusion(BaseFusionModule):
@@ -133,9 +147,7 @@ class FiLMFusion(BaseFusionModule):
         backbone_channels: int | None = None,
         **kwargs,
     ):
-        super().__init__(
-            config, temporal_dim=temporal_dim, backbone_channels=backbone_channels
-        )
+        super().__init__(config, temporal_dim=temporal_dim, backbone_channels=backbone_channels)
         self.film_layers = config.proprio_film_layers
         if self.temporal_dim is None or self.backbone_channels is None:
             raise ValueError(
@@ -199,8 +211,7 @@ class HybridFusion(BaseFusionModule):
         self.temporal_proj = nn.Linear(self.temporal_dim, self.dim_model)
         self.temporal_pos_embed = nn.Embedding(1, self.dim_model)
 
-    def forward(self, latent, state, vision_tokens, temporal_features=None,
-                contact_mask=None, **kwargs):
+    def forward(self, latent, state, vision_tokens, temporal_features=None, contact_mask=None, **kwargs):
         tokens = [latent, state]
         if temporal_features is not None:
             temporal_token = self.temporal_proj(temporal_features)  # (B, dim_model)
@@ -229,6 +240,7 @@ FUSION_MODULES = {
 def build_fusion_module(
     config: ACTConfig,
     temporal_dim: int | None = None,
+    temporal_tokens: int = 1,
     backbone_channels: int | None = None,
 ) -> BaseFusionModule:
     """Factory function to instantiate the correct fusion module.
@@ -237,14 +249,16 @@ def build_fusion_module(
         config: ACT config.
         temporal_dim: width of the temporal encoder's embedding (proprio_embedding).
             Required for token/hybrid/film fusion so projections are built eagerly.
+        temporal_tokens: number of separately addressable embedding tokens.
         backbone_channels: vision backbone feature-map channel count. Required
             for film fusion.
     """
     name = config.proprio_fusion_stage
     if name not in FUSION_MODULES:
-        raise ValueError(
-            f"Unknown fusion stage '{name}'. Available: {list(FUSION_MODULES.keys())}"
-        )
+        raise ValueError(f"Unknown fusion stage '{name}'. Available: {list(FUSION_MODULES.keys())}")
     return FUSION_MODULES[name](
-        config, temporal_dim=temporal_dim, backbone_channels=backbone_channels
+        config,
+        temporal_dim=temporal_dim,
+        temporal_tokens=temporal_tokens,
+        backbone_channels=backbone_channels,
     )
