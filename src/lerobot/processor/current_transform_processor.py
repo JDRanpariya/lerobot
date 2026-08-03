@@ -25,7 +25,8 @@ consistent with training. Parameters come verbatim from the view's
 so the transform travels with the checkpoint. Positions (0..5) are untouched.
 
 op semantics (must match make_lognorm_dataset.py exactly):
-  none   : winsorize only (caps), normalizer's MEAN_STD does the scaling.
+  none   : winsorize only (caps); the policy normalizer performs scaling
+           afterwards (MEAN_STD for ACT, MIN_MAX for Diffusion Policy).
   log1p  : winsorize then log1p.
   sqrt   : winsorize then sqrt.
   bin    : per-channel ordinal level = digitize(edges) / len(edges), in [0,1]
