@@ -160,7 +160,10 @@ class ACTConfig(PreTrainedConfig):
     # Gripper position index in state vector for contact detection
     proprio_gripper_idx: int = 5
 
-    # FiLM conditioning layers (1-indexed ResNet blocks)
+    # DEPRECATED / NO-OP: retained only for backward-compatible loading of old
+    # checkpoints. FiLM is applied to the single final backbone feature map
+    # (see modeling_act.py), NOT per ResNet block, so this list is never read.
+    # Do not rely on it to select conditioning layers.
     proprio_film_layers: list[int] = field(default_factory=lambda: [1, 2, 3])
 
     # === ADAPTIVE TRAINING (FACTR + OGM-GE reserve) ===

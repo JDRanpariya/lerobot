@@ -292,7 +292,12 @@ class DiffusionModel(nn.Module):
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
-    def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def generate_actions(
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Tensor:
         """
         This function expects `batch` to have:
         {
@@ -302,6 +307,11 @@ class DiffusionModel(nn.Module):
                 AND/OR
             "observation.environment_state": (B, n_obs_steps, environment_dim)
         }
+
+        `generator` is forwarded to `conditional_sample`, which uses it for both the
+        initial noise sample and every scheduler denoising step. Passing a generator
+        with a fixed state makes sampling reproducible (used by the diagnostics suite
+        to noise-match full vs. ablated counterfactual predictions).
         """
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
@@ -310,7 +320,9 @@ class DiffusionModel(nn.Module):
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # run sampling
-        actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
+        actions = self.conditional_sample(
+            batch_size, global_cond=global_cond, generator=generator, noise=noise
+        )
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1

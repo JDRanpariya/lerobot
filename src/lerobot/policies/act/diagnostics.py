@@ -172,6 +172,15 @@ class ModalityDiagnostics:
         # training and deployment (normalization, current transform, image
         # conversion). It is optional for backwards-compatible unit tests.
         self.preprocessor = preprocessor
+        # Fixed seed used to noise-match DP full vs. ablated predictions. Both the
+        # full and the ablated forward pass build a generator seeded identically to
+        # this, so their initial noise AND every scheduler step are identical and the
+        # action delta reflects the ablation, not sampling noise (ADR-0013 / plan step 2).
+        self._dp_seed = 12345
+        # Cache for the batch-invariant imputation vector (training-stat mean in the
+        # checkpoint's normalized space); see _state_impute_vector.
+        self._impute_vec: Optional[Tensor] = None
+        self._impute_vec_failed = False
 
     def _prepare_batch(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
         if self.preprocessor is None:
@@ -214,10 +223,66 @@ class ModalityDiagnostics:
     def _predict_chunk(self, batch: Dict[str, Tensor]) -> Tensor:
         """Policy-agnostic action-chunk prediction. ACT uses predict_action_chunk(batch);
         DP's predict_action_chunk reads queues (ignores batch), so we call
-        diffusion.generate_actions(batch) directly with a (B, n_obs_steps, ...) batch."""
+        diffusion.generate_actions(batch) directly with a (B, n_obs_steps, ...) batch.
+
+        For DP, a fresh generator seeded at self._dp_seed is passed so sampling is fully
+        deterministic. Callers that compare two predictions (full vs. ablated) get a NEW
+        generator per call, each initialized to the SAME state -> identical initial noise
+        and identical scheduler-step noise for both, so the delta reflects the input
+        change only. (A single shared generator would advance between calls and desync.)
+        ACT is deterministic and ignores the seed.
+        """
         if self.is_diffusion:
-            return self.policy.diffusion.generate_actions(batch)
+            gen = torch.Generator(device=self.device).manual_seed(self._dp_seed)
+            return self.policy.diffusion.generate_actions(batch, generator=gen)
         return self.policy.predict_action_chunk(batch)
+
+    def _state_impute_vector(self, state_dim: int, device, dtype) -> Optional[Tensor]:
+        """Fixed per-channel imputation values for observation.state, in the checkpoint's
+        NORMALIZED space: the training-statistic mean transformed by the same normalizer
+        the batch already went through. This is batch-invariant (independent of batch
+        composition/size and defined at B=1), unlike a per-batch mean.
+
+          MEAN_STD -> normalized mean is exactly 0.
+          MIN_MAX  -> 2*(mean - min)/(max - min) - 1.
+
+        Returns None if no preprocessor/stats are available (unit-test path), in which
+        case the caller falls back to the per-batch mean.
+        """
+        if self._impute_vec is not None:
+            return self._impute_vec
+        if self._impute_vec_failed or self.preprocessor is None:
+            return None
+        try:
+            from lerobot.configs import FeatureType, NormalizationMode
+
+            steps = getattr(self.preprocessor, "steps", None) or []
+            for st in steps:
+                ts = getattr(st, "_tensor_stats", None)
+                nm = getattr(st, "norm_map", None)
+                if not ts or nm is None or "observation.state" not in ts:
+                    continue
+                stats = ts["observation.state"]
+                mode = nm.get(FeatureType.STATE, NormalizationMode.IDENTITY)
+                if mode == NormalizationMode.MEAN_STD:
+                    vec = torch.zeros(state_dim, device=device, dtype=dtype)
+                elif mode == NormalizationMode.MIN_MAX:
+                    mn = stats["min"].to(device=device, dtype=dtype)
+                    mx = stats["max"].to(device=device, dtype=dtype)
+                    mean = stats["mean"].to(device=device, dtype=dtype)
+                    vec = 2.0 * (mean - mn) / ((mx - mn) + 1e-8) - 1.0
+                else:
+                    # IDENTITY or quantile modes: normalized mean not a simple constant
+                    # here; fall back to per-batch mean rather than guess.
+                    self._impute_vec_failed = True
+                    return None
+                self._impute_vec = vec.reshape(-1)[:state_dim]
+                return self._impute_vec
+        except Exception:
+            self._impute_vec_failed = True
+            return None
+        self._impute_vec_failed = True
+        return None
 
     def _zero_out(self, batch: Dict[str, Tensor], which: str) -> Tuple[Tensor, Tensor]:
         with torch.no_grad():
@@ -237,26 +302,36 @@ class ModalityDiagnostics:
                 if which == "current"
                 else [i for i in range(state_dim) if i not in self.current_indices]
             )
-            # Ablate a modality by MEAN-IMPUTATION (per-channel batch mean), not by
-            # setting to literal 0. Inputs are normalized; "0" is the mean only under
-            # MEAN_STD (ACT) but the MIDPOINT under MIN_MAX (DP STATE=MIN_MAX), which
-            # would make DP's baseline non-comparable to ACT's. Batch-mean is the mean
-            # regardless of norm mode -> the ablation removes the modality's discriminative
-            # information consistently across all model types. (Requires batch size > 1,
-            # which every _zero_out caller uses.)
+            # Ablate a modality by MEAN-IMPUTATION in normalized space. We use the fixed
+            # training-statistic mean (batch-invariant, defined at B=1), NOT the per-batch
+            # mean: the per-batch mean depends on batch composition/size and is undefined
+            # for B=1. The fixed vector removes the modality's discriminative information
+            # consistently across ACT (MEAN_STD) and DP (MIN_MAX). Falls back to the
+            # per-batch mean only when no normalizer stats are available (unit tests).
+            impute = self._state_impute_vector(state_dim, b["observation.state"].device,
+                                               b["observation.state"].dtype)
             if "observation.state" in b:
                 s = b["observation.state"].clone()
-                s[..., idx] = s[..., idx].mean(dim=0, keepdim=True)
+                if impute is not None:
+                    s[..., idx] = impute[idx]
+                else:
+                    s[..., idx] = s[..., idx].mean(dim=0, keepdim=True)
                 b["observation.state"] = s
-            # observation.state_window is ACT-only (temporal encoders); DP has no window
+            # observation.state_window is ACT-only (temporal encoders); DP has no window.
+            # Each K-step block holds the same current channels in the same normalized
+            # space, so impute each block with the same current-channel values.
             if not self.is_diffusion and "observation.state_window" in b:
                 w = b["observation.state_window"].clone()
                 n_cur = len(self.current_indices)
                 kp1 = w.shape[-1] // n_cur
                 if which == "current":
+                    cur_impute = None if impute is None else impute[self.current_indices]
                     for k in range(kp1):
                         sl = slice(k * n_cur, (k + 1) * n_cur)
-                        w[..., sl] = w[..., sl].mean(dim=0, keepdim=True)
+                        if cur_impute is not None:
+                            w[..., sl] = cur_impute
+                        else:
+                            w[..., sl] = w[..., sl].mean(dim=0, keepdim=True)
                 b["observation.state_window"] = w
             az = self._predict_chunk(b)
             return af, az
@@ -264,6 +339,44 @@ class ModalityDiagnostics:
     # ==============================================================
     # Tier 2: utilisation
     # ==============================================================
+    def _build_frame_batch(self, items) -> Dict[str, Tensor]:
+        """Stack a list of dataset frames into a (preprocessed) model batch, iterating
+        over ALL configured cameras (config.image_features), not just the hardcoded
+        'top' camera. Mirrors the canonical multi-cam builder in modality_attribution.py:
+          - ACT: keep individual camera keys; the preprocessor forms observation.images.
+          - DP:  add the n_obs_steps dim, then stack cameras into
+                 observation.images (B, n_obs, n_cam, C, H, W).
+        Single-camera checkpoints are unchanged (stack of one camera == unsqueeze)."""
+        cam_keys = list(self.config.image_features) if self.config.image_features else []
+        batch: Dict[str, Tensor] = {}
+        if "observation.state" in items[0]:
+            batch["observation.state"] = torch.stack(
+                [it["observation.state"] for it in items]
+            ).to(self.device)
+        for c in cam_keys:
+            if c in items[0]:
+                batch[c] = torch.stack([it[c] for it in items]).to(self.device)
+        needs_window = (not self.is_diffusion) and _needs_history_window(self.policy)
+        if needs_window and "observation.state_window" in items[0]:
+            batch["observation.state_window"] = torch.stack(
+                [it["observation.state_window"] for it in items]
+            ).to(self.device)
+        if self.is_diffusion:
+            for k in ["observation.state"] + cam_keys:
+                if k in batch:
+                    v = batch[k]
+                    batch[k] = (
+                        v.unsqueeze(1)
+                        .expand(-1, self.config.n_obs_steps, *([-1] * (v.dim() - 1)))
+                        .contiguous()
+                    )
+            present_cams = [c for c in cam_keys if c in batch]
+            if present_cams:
+                batch["observation.images"] = torch.stack([batch[c] for c in present_cams], dim=2)
+                for c in present_cams:
+                    del batch[c]
+        return self._prepare_batch(batch)
+
     def relative_zero_out_full(
         self,
         dataset,
@@ -310,29 +423,7 @@ class ModalityDiagnostics:
                 end = min(start + batch_size, n)
                 idxs = frame_ixs[start:end]
                 items = [dataset[i] for i in idxs]
-                # also remap phase_labels to the sampled frames for per_phase aggregation
-                batch = {}
-                for k in ["observation.state", "observation.images.top"]:
-                    if k in items[0]:
-                        batch[k] = torch.stack([it[k] for it in items]).to(self.device)
-                if self.is_diffusion:
-                    for k in ["observation.state", "observation.images.top"]:
-                        if k in batch:
-                            v = batch[k]
-                            batch[k] = (
-                                v.unsqueeze(1)
-                                .expand(-1, self.config.n_obs_steps, *([-1] * (v.dim() - 1)))
-                                .contiguous()
-                            )
-                    if "observation.images.top" in batch:
-                        batch["observation.images"] = batch["observation.images.top"].unsqueeze(-4)
-                        del batch["observation.images.top"]
-                needs_window = (not self.is_diffusion) and _needs_history_window(self.policy)
-                if needs_window and "observation.state_window" in items[0]:
-                    batch["observation.state_window"] = torch.stack(
-                        [it["observation.state_window"] for it in items]
-                    ).to(self.device)
-                batch = self._prepare_batch(batch)
+                batch = self._build_frame_batch(items)
                 af, ac = self._zero_out(batch, "current")
                 l2c = torch.norm(af - ac, dim=(1, 2))
                 norm = torch.norm(af, dim=(1, 2))
@@ -343,9 +434,9 @@ class ModalityDiagnostics:
                     print(f"  zero_out: {end}/{n} ({100 * end / n:.0f}%) {rate:.0f} fr/s", file=sys.stderr)
         # aggregate
         z_curr = float(all_z.mean())
-        # z_pos: re-run with position zeroed (cheaper: reuse the loop structure is overkill;
-        # approximate via a stratified subsample of position-zeroout on the same frames)
-        z_pos = self._estimate_z_pos(dataset, parquet_path, batch_size)
+        # z_pos: position-zeroout on the EXACT same frames as z_curr, so relative_curr
+        # and the USED/IGNORED gate compare like with like (not two different samples).
+        z_pos = self._estimate_z_pos(dataset, parquet_path, batch_size, frame_ixs=frame_ixs)
         rel = z_curr / (z_pos + 1e-8)
         # store the full array + aligned phase labels on self for per_phase to consume
         self._full_z_array = all_z
@@ -373,42 +464,23 @@ class ModalityDiagnostics:
             "probe": "relative_zero_out_full",
         }
 
-    def _estimate_z_pos(self, dataset, parquet_path, batch_size):
-        """Estimate z_pos by position zero-out on a subsample (for the control).
-        Full-frame z_pos would double runtime for a control we only need the
-        rough magnitude of; 512 frames gives a stable estimate."""
-        from time import time as _time
-
-        n = len(dataset)
-        step = max(1, n // 512)  # ~512 frames
-        idxs = list(range(0, n, step))[:512]
+    def _estimate_z_pos(self, dataset, parquet_path, batch_size, frame_ixs=None):
+        """Estimate z_pos by position zero-out. To keep z_pos comparable to z_curr (so
+        relative_curr and the gate are meaningful), it MUST be measured on the SAME frames
+        as z_curr: the caller passes the exact frame_ixs. Falls back to a strided
+        ~512-frame subsample only when no manifest is given (legacy/standalone callers)."""
+        if frame_ixs is not None:
+            idxs = list(frame_ixs)
+        else:
+            n = len(dataset)
+            step = max(1, n // 512)  # ~512 frames
+            idxs = list(range(0, n, step))[:512]
         zs = []
         with torch.no_grad():
             for start in range(0, len(idxs), batch_size):
                 chunk = idxs[start : start + batch_size]
                 items = [dataset[i] for i in chunk]
-                batch = {}
-                for k in ["observation.state", "observation.images.top"]:
-                    if k in items[0]:
-                        batch[k] = torch.stack([it[k] for it in items]).to(self.device)
-                if self.is_diffusion:
-                    for k in ["observation.state", "observation.images.top"]:
-                        if k in batch:
-                            v = batch[k]
-                            batch[k] = (
-                                v.unsqueeze(1)
-                                .expand(-1, self.config.n_obs_steps, *([-1] * (v.dim() - 1)))
-                                .contiguous()
-                            )
-                    if "observation.images.top" in batch:
-                        batch["observation.images"] = batch["observation.images.top"].unsqueeze(-4)
-                        del batch["observation.images.top"]
-                needs_window = (not self.is_diffusion) and _needs_history_window(self.policy)
-                if needs_window and "observation.state_window" in items[0]:
-                    batch["observation.state_window"] = torch.stack(
-                        [it["observation.state_window"] for it in items]
-                    ).to(self.device)
-                batch = self._prepare_batch(batch)
+                batch = self._build_frame_batch(items)
                 af, ap = self._zero_out(batch, "position")
                 l2p = torch.norm(af - ap, dim=(1, 2))
                 norm = torch.norm(af, dim=(1, 2))
