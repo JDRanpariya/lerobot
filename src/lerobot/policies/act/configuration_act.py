@@ -75,6 +75,10 @@ class ACTConfig(PreTrainedConfig):
             ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
             1 when using this feature, as inference needs to happen at every step to form an ensemble. For
             more information on how ensembling works, please see `ACTTemporalEnsembler`.
+        temporal_ensemble_window: Optional maximum number of recent overlapping chunk predictions included
+            in each temporal ensemble. Defaults to None, which preserves the original ACT behavior of using
+            every prediction still overlapping the current step (up to `chunk_size`). This option requires
+            `temporal_ensemble_coeff` and does not change how often the policy is queried.
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
@@ -117,6 +121,10 @@ class ACTConfig(PreTrainedConfig):
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
+    # None preserves the upstream full-overlap ensemble. A finite value drops
+    # predictions older than this many control steps while still re-planning
+    # every step and blending the retained predictions.
+    temporal_ensemble_window: int | None = None
 
     # Training and loss computation.
     dropout: float = 0.1
@@ -254,6 +262,17 @@ class ACTConfig(PreTrainedConfig):
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
                 "because the policy needs to be queried every step to compute the ensembled action."
             )
+        if self.temporal_ensemble_window is not None:
+            if self.temporal_ensemble_coeff is None:
+                raise ValueError(
+                    "`temporal_ensemble_window` requires `temporal_ensemble_coeff` because "
+                    "there is no temporal ensemble to bound otherwise."
+                )
+            if not 1 <= self.temporal_ensemble_window <= self.chunk_size:
+                raise ValueError(
+                    "`temporal_ensemble_window` must be between 1 and `chunk_size`. Got "
+                    f"{self.temporal_ensemble_window} for a chunk size of {self.chunk_size}."
+                )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

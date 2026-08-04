@@ -67,7 +67,11 @@ class ACTPolicy(PreTrainedPolicy):
         self.model = ACT(config)
 
         if config.temporal_ensemble_coeff is not None:
-            self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
+            self.temporal_ensembler = ACTTemporalEnsembler(
+                config.temporal_ensemble_coeff,
+                config.chunk_size,
+                temporal_ensemble_window=config.temporal_ensemble_window,
+            )
 
         self.reset()
 
@@ -195,7 +199,12 @@ class ACTPolicy(PreTrainedPolicy):
 
 
 class ACTTemporalEnsembler:
-    def __init__(self, temporal_ensemble_coeff: float, chunk_size: int) -> None:
+    def __init__(
+        self,
+        temporal_ensemble_coeff: float,
+        chunk_size: int,
+        temporal_ensemble_window: int | None = None,
+    ) -> None:
         """Temporal ensembling as described in Algorithm 2 of https://huggingface.co/papers/2304.13705.
 
         The weights are calculated as wᵢ = exp(-temporal_ensemble_coeff * i) where w₀ is the oldest action.
@@ -209,8 +218,13 @@ class ACTTemporalEnsembler:
         https://github.com/huggingface/lerobot/pull/319 hint at why highly weighing new actions might be
         detrimental: doing so aggressively may diminish the benefits of action chunking).
 
-        Here we use an online method for computing the average rather than caching a history of actions in
-        order to compute the average offline. For a simple 1D sequence it looks something like:
+        `temporal_ensemble_window` optionally limits the ensemble to that many most-recent overlapping chunk
+        predictions. It bounds how long a prediction can influence execution without changing the model's
+        chunk size or the re-plan-every-step control loop. None preserves the original full-overlap algorithm.
+
+        The default full-overlap path uses an online average rather than caching a history of actions. A
+        finite window caches only the retained chunks so that expired predictions can be removed exactly.
+        For a simple 1D full-overlap sequence, the online calculation looks something like:
 
         ```
         import torch
@@ -237,7 +251,13 @@ class ACTTemporalEnsembler:
         print("online", avg)
         ```
         """
+        if temporal_ensemble_window is not None and not 1 <= temporal_ensemble_window <= chunk_size:
+            raise ValueError(
+                "temporal_ensemble_window must be between 1 and chunk_size; got "
+                f"{temporal_ensemble_window} for chunk_size={chunk_size}."
+            )
         self.chunk_size = chunk_size
+        self.temporal_ensemble_window = temporal_ensemble_window
         self.ensemble_weights = torch.exp(-temporal_ensemble_coeff * torch.arange(chunk_size))
         self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0)
         self.reset()
@@ -247,12 +267,46 @@ class ACTTemporalEnsembler:
         self.ensembled_actions = None
         # (chunk_size,) count of how many actions are in the ensemble for each time step in the sequence.
         self.ensembled_actions_count = None
+        self._prediction_history = (
+            deque(maxlen=self.temporal_ensemble_window) if self.temporal_ensemble_window is not None else None
+        )
+
+    def _update_recent_window(self, actions: Tensor) -> Tensor:
+        """Blend the current-step predictions from only the retained recent chunks."""
+        if actions.ndim != 3 or actions.shape[1] != self.chunk_size:
+            raise ValueError(
+                "actions must have shape (batch, chunk_size, action_dim); got "
+                f"{tuple(actions.shape)} with chunk_size={self.chunk_size}."
+            )
+        if self._prediction_history is None:
+            raise RuntimeError("Recent-window state is unavailable without temporal_ensemble_window.")
+
+        # Store complete chunks because at the next control step the same chunk's
+        # index 1 predicts the new current action, then index 2, and so forth.
+        # An age-k chunk is only ever read at its index k, and k < window,
+        # so later chunk positions can be discarded when the chunk is stored.
+        self._prediction_history.append(actions[:, : self.temporal_ensemble_window].clone())
+        n_predictions = len(self._prediction_history)
+        predictions = torch.stack(
+            [
+                chunk[:, n_predictions - history_index - 1]
+                for history_index, chunk in enumerate(self._prediction_history)
+            ],
+            dim=1,
+        )
+        self.ensemble_weights = self.ensemble_weights.to(device=actions.device, dtype=actions.dtype)
+        weights = self.ensemble_weights[:n_predictions]
+        weights = weights.view(1, n_predictions, 1)
+        return (predictions * weights).sum(dim=1) / weights.sum()
 
     def update(self, actions: Tensor) -> Tensor:
         """
         Takes a (batch, chunk_size, action_dim) sequence of actions, update the temporal ensemble for all
         time steps, and pop/return the next batch of actions in the sequence.
         """
+        if self.temporal_ensemble_window is not None:
+            return self._update_recent_window(actions)
+
         self.ensemble_weights = self.ensemble_weights.to(device=actions.device)
         self.ensemble_weights_cumsum = self.ensemble_weights_cumsum.to(device=actions.device)
         if self.ensembled_actions is None:
