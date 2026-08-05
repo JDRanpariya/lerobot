@@ -77,7 +77,6 @@ class ACTPolicy(PreTrainedPolicy):
                     gripper_index=config.temporal_ensemble_gripper_index,
                     min_open_excursion=config.temporal_ensemble_min_open_excursion,
                     close_fraction=config.temporal_ensemble_close_fraction,
-                    reopen_fraction=config.temporal_ensemble_reopen_fraction,
                     stable_steps=config.temporal_ensemble_phase_stable_steps,
                     stable_delta_fraction=config.temporal_ensemble_phase_stable_delta_fraction,
                 )
@@ -160,12 +159,13 @@ class ACTPolicy(PreTrainedPolicy):
         if self.config.temporal_ensemble_coeff is not None:
             if self.temporal_ensemble_phase_detector is not None:
                 phase = self.temporal_ensemble_phase_detector.update(batch[OBS_STATE])
-                if phase.changed:
+                if phase.changed and phase.post_grasp and not self._post_grasp_open_loop:
                     # Never execute an action predicted under the controller
-                    # used on the other side of the grasp boundary.
+                    # used before the grasp boundary. This is deliberately a
+                    # one-way episode latch: release must not resume TE.
                     self.temporal_ensembler.reset()
                     self._action_queue.clear()
-                    self._post_grasp_open_loop = phase.post_grasp
+                    self._post_grasp_open_loop = True
                 if self._post_grasp_open_loop:
                     if len(self._action_queue) == 0:
                         actions = self.predict_action_chunk(batch)

@@ -107,12 +107,11 @@ def test_act_switches_from_temporal_ensemble_to_unensembled_chunk_after_grasp():
     torch.testing.assert_close(ACTPolicy.select_action(policy, dict(batch)), torch.tensor([[101.0]]))
 
 
-def test_act_reopen_discards_post_grasp_queue_and_resumes_temporal_ensemble():
+def test_act_release_cannot_clear_post_grasp_episode_latch():
     chunks = iter(
         [
             torch.arange(8, dtype=torch.float32).view(1, 8, 1),
             (100 + torch.arange(8, dtype=torch.float32)).view(1, 8, 1),
-            (200 + torch.arange(8, dtype=torch.float32)).view(1, 8, 1),
         ]
     )
     detector = _Detector(
@@ -141,8 +140,10 @@ def test_act_reopen_discards_post_grasp_queue_and_resumes_temporal_ensemble():
 
     torch.testing.assert_close(ACTPolicy.select_action(policy, dict(batch)), torch.tensor([[0.0]]))
     torch.testing.assert_close(ACTPolicy.select_action(policy, dict(batch)), torch.tensor([[100.0]]))
-    # Reopening discards the remaining 101..107 queue and starts a fresh ensemble.
-    torch.testing.assert_close(ACTPolicy.select_action(policy, dict(batch)), torch.tensor([[200.0]]))
+    # Even a stale detector implementation reporting a reopen cannot discard
+    # the post-grasp queue or resume temporal ensembling at release.
+    torch.testing.assert_close(ACTPolicy.select_action(policy, dict(batch)), torch.tensor([[101.0]]))
+    assert policy._post_grasp_open_loop
 
 
 def test_act_post_grasp_unensembled_execution_requires_temporal_ensemble():
@@ -177,6 +178,13 @@ def test_gripper_detector_locks_either_opening_polarity(direction):
     detector.update(torch.tensor([[0, 0, 0, 0, 0, 0.39 * direction]], dtype=torch.float32))
     update = detector.update(torch.tensor([[0, 0, 0, 0, 0, 0.38 * direction]], dtype=torch.float32))
     assert update.changed and update.post_grasp
+
+    # Reopening at release never leaves post-grasp within the same episode.
+    for value in [0.5 * direction, 0.9 * direction, 1.0 * direction] * 3:
+        update = detector.update(torch.tensor([[0, 0, 0, 0, 0, value]], dtype=torch.float32))
+        assert update.post_grasp and not update.changed
+    detector.reset()
+    assert not detector.post_grasp
 
 
 class _Detector:

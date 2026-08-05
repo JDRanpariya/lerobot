@@ -127,7 +127,6 @@ class ACTConfig(PreTrainedConfig):
     temporal_ensemble_gripper_index: int = 5
     temporal_ensemble_min_open_excursion: float = 0.25
     temporal_ensemble_close_fraction: float = 0.5
-    temporal_ensemble_reopen_fraction: float = 0.8
     temporal_ensemble_phase_stable_steps: int = 15
     temporal_ensemble_phase_stable_delta_fraction: float = 0.02
 
@@ -294,10 +293,8 @@ class ACTConfig(PreTrainedConfig):
                 raise ValueError("`temporal_ensemble_gripper_index` must be non-negative.")
             if self.temporal_ensemble_min_open_excursion <= 0:
                 raise ValueError("`temporal_ensemble_min_open_excursion` must be positive.")
-            if not (0 < self.temporal_ensemble_close_fraction < self.temporal_ensemble_reopen_fraction < 1):
-                raise ValueError(
-                    "Require 0 < temporal_ensemble_close_fraction < temporal_ensemble_reopen_fraction < 1."
-                )
+            if not 0 < self.temporal_ensemble_close_fraction < 1:
+                raise ValueError("`temporal_ensemble_close_fraction` must be between 0 and 1.")
             if self.temporal_ensemble_phase_stable_steps <= 0:
                 raise ValueError("`temporal_ensemble_phase_stable_steps` must be positive.")
             if self.temporal_ensemble_phase_stable_delta_fraction <= 0:

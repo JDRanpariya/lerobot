@@ -12,7 +12,7 @@
 
 The utilities in this module intentionally operate on already-normalized
 policy inputs. The grasp detector uses ratios within the observed gripper
-excursion, rather than absolute servo coordinates, so its close/reopen logic
+excursion, rather than absolute servo coordinates, so its open/close logic
 is invariant to ACT's mean/std versus Diffusion Policy's min/max affine scale.
 The minimum arming excursion remains a normalization-domain configuration.
 """
@@ -35,15 +35,16 @@ class PhaseUpdate:
 
 
 class GripperCyclePhaseDetector:
-    """Detect a completed open-then-close grasp cycle with hysteresis.
+    """Detect and latch a completed open-then-close grasp cycle.
 
     The SO-101 demonstrations begin with the gripper near its closed baseline,
     open it around the object, and close it to a held-object aperture. The
     detector locks onto whichever opening direction first exceeds a minimum
     excursion from the initial value and enters ``post_grasp`` after the
     gripper retreats by ``close_fraction`` of that excursion for
-    ``stable_steps`` consecutive observations. A later
-    reopening above ``reopen_fraction`` returns to pre-grasp, allowing retries.
+    ``stable_steps`` consecutive observations. The post-grasp state is an
+    episode latch: reopening for an intentional release does not change the
+    controller. Only :meth:`reset` starts a new pre-grasp episode.
 
     Dynamic execution is a rollout-only facility and currently supports the
     single-environment batch used by ``lerobot-rollout``. The opening polarity
@@ -57,7 +58,6 @@ class GripperCyclePhaseDetector:
         gripper_index: int = 5,
         min_open_excursion: float = 0.25,
         close_fraction: float = 0.5,
-        reopen_fraction: float = 0.8,
         stable_steps: int = 15,
         stable_delta_fraction: float = 0.02,
     ) -> None:
@@ -65,8 +65,8 @@ class GripperCyclePhaseDetector:
             raise ValueError("gripper_index must be non-negative")
         if min_open_excursion <= 0:
             raise ValueError("min_open_excursion must be positive")
-        if not 0 < close_fraction < reopen_fraction < 1:
-            raise ValueError("require 0 < close_fraction < reopen_fraction < 1")
+        if not 0 < close_fraction < 1:
+            raise ValueError("close_fraction must be between 0 and 1")
         if stable_steps <= 0:
             raise ValueError("stable_steps must be positive")
         if stable_delta_fraction <= 0:
@@ -75,7 +75,6 @@ class GripperCyclePhaseDetector:
         self.gripper_index = gripper_index
         self.min_open_excursion = min_open_excursion
         self.close_fraction = close_fraction
-        self.reopen_fraction = reopen_fraction
         self.stable_steps = stable_steps
         self.stable_delta_fraction = stable_delta_fraction
         self.reset()
@@ -138,18 +137,6 @@ class GripperCyclePhaseDetector:
                 self._post_grasp = True
                 self._candidate_steps = 0
                 changed = True
-        else:
-            candidate = bool(
-                excursion >= self.min_open_excursion
-                and oriented_value >= self.reopen_fraction * excursion
-                and stable
-            )
-            self._candidate_steps = self._candidate_steps + 1 if candidate else 0
-            if self._candidate_steps >= self.stable_steps:
-                self._post_grasp = False
-                self._candidate_steps = 0
-                changed = True
-
         self._previous = value.clone()
         return PhaseUpdate(post_grasp=self._post_grasp, changed=changed)
 
