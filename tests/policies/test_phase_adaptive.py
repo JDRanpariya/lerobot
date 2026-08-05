@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.policies.phase_adaptive import (
     ChunkTemporalEnsembler,
@@ -36,6 +37,46 @@ def test_switching_chunk_window_discards_pre_transition_predictions():
     torch.testing.assert_close(ensemble.update(post, output_steps=4), post[:, :4])
 
 
+def test_act_episode_reset_restores_pre_grasp_ensemble_parameters():
+    class _Ensembler:
+        def __init__(self):
+            self.parameters = None
+            self.was_reset = False
+
+        def set_runtime_parameters(self, **parameters):
+            self.parameters = parameters
+
+        def reset(self):
+            self.was_reset = True
+
+    class _PhaseDetector:
+        def __init__(self):
+            self.was_reset = False
+
+        def reset(self):
+            self.was_reset = True
+
+    policy = SimpleNamespace(
+        config=SimpleNamespace(
+            temporal_ensemble_coeff=0.01,
+            temporal_ensemble_window=None,
+            proprio_temporal_encoder="none",
+            proprio_K=0,
+        ),
+        temporal_ensembler=_Ensembler(),
+        temporal_ensemble_phase_detector=_PhaseDetector(),
+    )
+
+    ACTPolicy.reset(policy)
+
+    assert policy.temporal_ensembler.parameters == {
+        "temporal_ensemble_coeff": 0.01,
+        "temporal_ensemble_window": None,
+    }
+    assert policy.temporal_ensembler.was_reset
+    assert policy.temporal_ensemble_phase_detector.was_reset
+
+
 @pytest.mark.parametrize("direction", [1.0, -1.0])
 def test_gripper_detector_locks_either_opening_polarity(direction):
     detector = GripperCyclePhaseDetector(
@@ -47,9 +88,7 @@ def test_gripper_detector_locks_either_opening_polarity(direction):
         detector.update(torch.tensor([[0, 0, 0, 0, 0, value]], dtype=torch.float32))
     assert not detector.post_grasp
     detector.update(torch.tensor([[0, 0, 0, 0, 0, 0.39 * direction]], dtype=torch.float32))
-    update = detector.update(
-        torch.tensor([[0, 0, 0, 0, 0, 0.38 * direction]], dtype=torch.float32)
-    )
+    update = detector.update(torch.tensor([[0, 0, 0, 0, 0, 0.38 * direction]], dtype=torch.float32))
     assert update.changed and update.post_grasp
 
 
@@ -111,13 +150,9 @@ def test_dp_phase_transition_clears_fifo_before_selecting_transition_action():
     )
     batch = {OBS_STATE: torch.zeros(1, 6)}
 
-    torch.testing.assert_close(
-        DiffusionPolicy.select_action(policy, dict(batch)), torch.tensor([[0.0]])
-    )
+    torch.testing.assert_close(DiffusionPolicy.select_action(policy, dict(batch)), torch.tensor([[0.0]]))
     # Without the atomic clear this would be action 1 from the first chunk.
-    torch.testing.assert_close(
-        DiffusionPolicy.select_action(policy, dict(batch)), torch.tensor([[100.0]])
-    )
+    torch.testing.assert_close(DiffusionPolicy.select_action(policy, dict(batch)), torch.tensor([[100.0]]))
     assert policy._active_replan_steps == 2
 
 

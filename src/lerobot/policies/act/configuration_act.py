@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from dataclasses import dataclass, field
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
@@ -79,6 +80,9 @@ class ACTConfig(PreTrainedConfig):
             in each temporal ensemble. Defaults to None, which preserves the original ACT behavior of using
             every prediction still overlapping the current step (up to `chunk_size`). This option requires
             `temporal_ensemble_coeff` and does not change how often the policy is queried.
+        temporal_ensemble_post_grasp_coeff: Optional coefficient used after the calibrated grasp transition.
+            Unlike a hard recent-history window, changing this coefficient retains all aligned chunk predictions
+            and only changes their relative weights. Defaults to None, which keeps `temporal_ensemble_coeff`.
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
@@ -129,6 +133,10 @@ class ACTConfig(PreTrainedConfig):
     # completed grasp, then reset it and use this window after the gripper's
     # causal open-close cycle is detected.
     temporal_ensemble_post_grasp_window: int | None = None
+    # Prefer this soft, full-history reweighting for phase-adaptive execution.
+    # A hard short window also removes the late indices of every 50-step ACT
+    # plan and can attenuate motion for checkpoints trained at chunk_size=50.
+    temporal_ensemble_post_grasp_coeff: float | None = None
     temporal_ensemble_gripper_index: int = 5
     temporal_ensemble_min_open_excursion: float = 0.25
     temporal_ensemble_close_fraction: float = 0.5
@@ -291,36 +299,37 @@ class ACTConfig(PreTrainedConfig):
                     "`temporal_ensemble_window` must be between 1 and `chunk_size`. Got "
                     f"{self.temporal_ensemble_window} for a chunk size of {self.chunk_size}."
                 )
-        if self.temporal_ensemble_post_grasp_window is not None:
+        dynamic_temporal_ensemble = (
+            self.temporal_ensemble_post_grasp_window is not None
+            or self.temporal_ensemble_post_grasp_coeff is not None
+        )
+        if dynamic_temporal_ensemble:
             if self.temporal_ensemble_coeff is None:
-                raise ValueError(
-                    "`temporal_ensemble_post_grasp_window` requires `temporal_ensemble_coeff`."
-                )
-            if not 1 <= self.temporal_ensemble_post_grasp_window <= self.chunk_size:
-                raise ValueError(
-                    "`temporal_ensemble_post_grasp_window` must be between 1 and `chunk_size`. Got "
-                    f"{self.temporal_ensemble_post_grasp_window} for chunk_size={self.chunk_size}."
-                )
+                raise ValueError("Phase-adaptive temporal ensembling requires `temporal_ensemble_coeff`.")
+            if self.temporal_ensemble_post_grasp_coeff is not None and not math.isfinite(
+                self.temporal_ensemble_post_grasp_coeff
+            ):
+                raise ValueError("`temporal_ensemble_post_grasp_coeff` must be finite.")
+        if self.temporal_ensemble_post_grasp_window is not None and not (
+            1 <= self.temporal_ensemble_post_grasp_window <= self.chunk_size
+        ):
+            raise ValueError(
+                "`temporal_ensemble_post_grasp_window` must be between 1 and `chunk_size`. Got "
+                f"{self.temporal_ensemble_post_grasp_window} for chunk_size={self.chunk_size}."
+            )
+        if dynamic_temporal_ensemble:
             if self.temporal_ensemble_gripper_index < 0:
                 raise ValueError("`temporal_ensemble_gripper_index` must be non-negative.")
             if self.temporal_ensemble_min_open_excursion <= 0:
                 raise ValueError("`temporal_ensemble_min_open_excursion` must be positive.")
-            if not (
-                0
-                < self.temporal_ensemble_close_fraction
-                < self.temporal_ensemble_reopen_fraction
-                < 1
-            ):
+            if not (0 < self.temporal_ensemble_close_fraction < self.temporal_ensemble_reopen_fraction < 1):
                 raise ValueError(
-                    "Require 0 < temporal_ensemble_close_fraction < "
-                    "temporal_ensemble_reopen_fraction < 1."
+                    "Require 0 < temporal_ensemble_close_fraction < temporal_ensemble_reopen_fraction < 1."
                 )
             if self.temporal_ensemble_phase_stable_steps <= 0:
                 raise ValueError("`temporal_ensemble_phase_stable_steps` must be positive.")
             if self.temporal_ensemble_phase_stable_delta_fraction <= 0:
-                raise ValueError(
-                    "`temporal_ensemble_phase_stable_delta_fraction` must be positive."
-                )
+                raise ValueError("`temporal_ensemble_phase_stable_delta_fraction` must be positive.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

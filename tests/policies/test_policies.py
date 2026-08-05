@@ -573,11 +573,18 @@ def test_act_policy_wires_recent_window_from_config(monkeypatch):
     captured = {}
 
     class SpyEnsembler:
-        def __init__(self, coeff, chunk_size, temporal_ensemble_window=None):
+        def __init__(
+            self,
+            coeff,
+            chunk_size,
+            temporal_ensemble_window=None,
+            cache_full_history=False,
+        ):
             captured.update(
                 coeff=coeff,
                 chunk_size=chunk_size,
                 temporal_ensemble_window=temporal_ensemble_window,
+                cache_full_history=cache_full_history,
             )
 
         def reset(self):
@@ -604,8 +611,41 @@ def test_act_policy_wires_recent_window_from_config(monkeypatch):
         "coeff": 0.01,
         "chunk_size": 50,
         "temporal_ensemble_window": 10,
+        "cache_full_history": False,
         "reset": True,
     }
+
+
+def test_act_temporal_ensembler_runtime_reweight_preserves_full_history():
+    chunks = torch.stack([torch.arange(8, dtype=torch.float32) + 100 * step for step in range(4)]).view(
+        1, 4, 8, 1
+    )
+    ensembler = ACTTemporalEnsembler(0.01, 8, cache_full_history=True)
+    for step in range(3):
+        ensembler.update(chunks[:, step])
+
+    ensembler.set_runtime_parameters(
+        temporal_ensemble_coeff=0.0,
+        temporal_ensemble_window=None,
+    )
+    output = ensembler.update(chunks[:, 3])
+    # Current-step diagonal: 3, 102, 201, 300. Reweighting to zero
+    # is uniform and must keep all four predictions rather than reset.
+    torch.testing.assert_close(output, torch.tensor([[151.5]]))
+
+
+def test_act_temporal_ensembler_cached_full_matches_optimized_full():
+    optimized = ACTTemporalEnsembler(0.01, 50)
+    cached = ACTTemporalEnsembler(0.01, 50, cache_full_history=True)
+    with seeded_context(4):
+        chunks = torch.rand(2, 120, 50, 6)
+    for step in range(chunks.shape[1]):
+        torch.testing.assert_close(
+            cached.update(chunks[:, step]),
+            optimized.update(chunks[:, step]),
+            rtol=1e-4,
+            atol=1e-4,
+        )
 
 
 def test_act_config_recent_window_round_trip_and_legacy_default(tmp_path):

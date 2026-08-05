@@ -35,8 +35,8 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
-from ..pretrained import PreTrainedPolicy
 from ..phase_adaptive import GripperCyclePhaseDetector
+from ..pretrained import PreTrainedPolicy
 from .configuration_act import ACTConfig
 from .fusion_modules import build_fusion_module
 from .temporal_encoders import build_temporal_encoder
@@ -72,6 +72,10 @@ class ACTPolicy(PreTrainedPolicy):
                 config.temporal_ensemble_coeff,
                 config.chunk_size,
                 temporal_ensemble_window=config.temporal_ensemble_window,
+                cache_full_history=(
+                    config.temporal_ensemble_post_grasp_window is not None
+                    or config.temporal_ensemble_post_grasp_coeff is not None
+                ),
             )
             self.temporal_ensemble_phase_detector = (
                 GripperCyclePhaseDetector(
@@ -82,7 +86,10 @@ class ACTPolicy(PreTrainedPolicy):
                     stable_steps=config.temporal_ensemble_phase_stable_steps,
                     stable_delta_fraction=config.temporal_ensemble_phase_stable_delta_fraction,
                 )
-                if config.temporal_ensemble_post_grasp_window is not None
+                if (
+                    config.temporal_ensemble_post_grasp_window is not None
+                    or config.temporal_ensemble_post_grasp_coeff is not None
+                )
                 else None
             )
 
@@ -112,9 +119,16 @@ class ACTPolicy(PreTrainedPolicy):
     def reset(self):
         """This should be called whenever the environment is reset."""
         if self.config.temporal_ensemble_coeff is not None:
-            self.temporal_ensembler.reset()
             if self.temporal_ensemble_phase_detector is not None:
+                # A previous episode may have ended with post-grasp runtime
+                # parameters active. Restore the declared pre-grasp controller
+                # before clearing history; reset() alone does not change them.
+                self.temporal_ensembler.set_runtime_parameters(
+                    temporal_ensemble_coeff=self.config.temporal_ensemble_coeff,
+                    temporal_ensemble_window=self.config.temporal_ensemble_window,
+                )
                 self.temporal_ensemble_phase_detector.reset()
+            self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
@@ -162,10 +176,18 @@ class ACTPolicy(PreTrainedPolicy):
                 if phase.changed:
                     window = (
                         self.config.temporal_ensemble_post_grasp_window
-                        if phase.post_grasp
+                        if phase.post_grasp and self.config.temporal_ensemble_post_grasp_window is not None
                         else self.config.temporal_ensemble_window
                     )
-                    self.temporal_ensembler.set_window(window)
+                    coeff = (
+                        self.config.temporal_ensemble_post_grasp_coeff
+                        if phase.post_grasp and self.config.temporal_ensemble_post_grasp_coeff is not None
+                        else self.config.temporal_ensemble_coeff
+                    )
+                    self.temporal_ensembler.set_runtime_parameters(
+                        temporal_ensemble_coeff=coeff,
+                        temporal_ensemble_window=window,
+                    )
             actions = self.predict_action_chunk(batch)
             action = self.temporal_ensembler.update(actions)
             return action
@@ -228,6 +250,7 @@ class ACTTemporalEnsembler:
         temporal_ensemble_coeff: float,
         chunk_size: int,
         temporal_ensemble_window: int | None = None,
+        cache_full_history: bool = False,
     ) -> None:
         """Temporal ensembling as described in Algorithm 2 of https://huggingface.co/papers/2304.13705.
 
@@ -283,6 +306,7 @@ class ACTTemporalEnsembler:
         self.chunk_size = chunk_size
         self.temporal_ensemble_coeff = temporal_ensemble_coeff
         self.temporal_ensemble_window = temporal_ensemble_window
+        self.cache_full_history = cache_full_history
         self.ensemble_weights = torch.exp(-temporal_ensemble_coeff * torch.arange(chunk_size))
         self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0)
         self.reset()
@@ -297,6 +321,30 @@ class ACTTemporalEnsembler:
         self.temporal_ensemble_window = temporal_ensemble_window
         self.reset()
 
+    def set_runtime_parameters(
+        self,
+        *,
+        temporal_ensemble_coeff: float,
+        temporal_ensemble_window: int | None,
+    ) -> None:
+        """Change phase-specific weights without discarding aligned predictions.
+
+        Runtime reweighting requires the full-history cache. The optimized
+        upstream accumulator cannot be reweighted retrospectively because it
+        has already collapsed each diagonal to one average.
+        """
+        if not self.cache_full_history:
+            raise RuntimeError("Runtime temporal-ensemble changes require cache_full_history=True.")
+        if temporal_ensemble_window is not None and not 1 <= temporal_ensemble_window <= self.chunk_size:
+            raise ValueError(
+                "temporal_ensemble_window must be between 1 and chunk_size; got "
+                f"{temporal_ensemble_window} for chunk_size={self.chunk_size}."
+            )
+        self.temporal_ensemble_coeff = temporal_ensemble_coeff
+        self.temporal_ensemble_window = temporal_ensemble_window
+        self.ensemble_weights = torch.exp(-temporal_ensemble_coeff * torch.arange(self.chunk_size))
+        self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0)
+
     def reset(self):
         """Resets the online computation variables."""
         self.ensembled_actions = None
@@ -305,6 +353,30 @@ class ACTTemporalEnsembler:
         self._prediction_history = (
             deque(maxlen=self.temporal_ensemble_window) if self.temporal_ensemble_window is not None else None
         )
+        self._full_prediction_history = deque(maxlen=self.chunk_size) if self.cache_full_history else None
+
+    def _update_cached_history(self, actions: Tensor) -> Tensor:
+        """Blend aligned predictions while retaining enough history to reweight at runtime."""
+        if actions.ndim != 3 or actions.shape[1] != self.chunk_size:
+            raise ValueError(
+                "actions must have shape (batch, chunk_size, action_dim); got "
+                f"{tuple(actions.shape)} with chunk_size={self.chunk_size}."
+            )
+        if self._full_prediction_history is None:
+            raise RuntimeError("Full prediction history was not enabled.")
+        self._full_prediction_history.append(actions.clone())
+        window = self.temporal_ensemble_window or self.chunk_size
+        retained = list(self._full_prediction_history)[-window:]
+        n_predictions = len(retained)
+        predictions = torch.stack(
+            [chunk[:, n_predictions - history_index - 1] for history_index, chunk in enumerate(retained)],
+            dim=1,
+        )
+        weights = torch.exp(
+            -self.temporal_ensemble_coeff
+            * torch.arange(n_predictions, device=actions.device, dtype=actions.dtype)
+        ).view(1, n_predictions, 1)
+        return (predictions * weights).sum(dim=1) / weights.sum()
 
     def _update_recent_window(self, actions: Tensor) -> Tensor:
         """Blend the current-step predictions from only the retained recent chunks."""
@@ -339,12 +411,12 @@ class ACTTemporalEnsembler:
         Takes a (batch, chunk_size, action_dim) sequence of actions, update the temporal ensemble for all
         time steps, and pop/return the next batch of actions in the sequence.
         """
+        if self.cache_full_history:
+            return self._update_cached_history(actions)
         if self.temporal_ensemble_window is not None:
             return self._update_recent_window(actions)
 
-        self.ensemble_weights = self.ensemble_weights.to(
-            device=actions.device, dtype=actions.dtype
-        )
+        self.ensemble_weights = self.ensemble_weights.to(device=actions.device, dtype=actions.dtype)
         self.ensemble_weights_cumsum = self.ensemble_weights_cumsum.to(
             device=actions.device, dtype=actions.dtype
         )
