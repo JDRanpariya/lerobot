@@ -160,19 +160,10 @@ class DiffusionConfig(PreTrainedConfig):
     # The thesis evaluator blocks robot rollout until asynchronous prediction
     # prefetch and rollout-level safe stopping are implemented.
     temporal_ensemble_coeff: float | None = None
-    temporal_ensemble_window: int | None = None
     temporal_ensemble_replan_steps: int | None = None
-    temporal_ensemble_post_grasp_window: int | None = None
-    temporal_ensemble_post_grasp_replan_steps: int | None = None
     # Optional model-inference cutoff for development. Raising here does not by
     # itself establish a robot-level safe stop.
     temporal_ensemble_inference_deadline_ms: float | None = None
-    temporal_ensemble_gripper_index: int = 5
-    temporal_ensemble_min_open_excursion: float = 0.25
-    temporal_ensemble_close_fraction: float = 0.5
-    temporal_ensemble_reopen_fraction: float = 0.8
-    temporal_ensemble_phase_stable_steps: int = 15
-    temporal_ensemble_phase_stable_delta_fraction: float = 0.02
 
     # Optimization
     compile_model: bool = False
@@ -238,77 +229,23 @@ class DiffusionConfig(PreTrainedConfig):
 
         if self.temporal_ensemble_coeff is None:
             temporal_options = (
-                self.temporal_ensemble_window,
                 self.temporal_ensemble_replan_steps,
-                self.temporal_ensemble_post_grasp_window,
-                self.temporal_ensemble_post_grasp_replan_steps,
                 self.temporal_ensemble_inference_deadline_ms,
             )
             if any(value is not None for value in temporal_options):
                 raise ValueError("Diffusion temporal-ensemble options require `temporal_ensemble_coeff`.")
         else:
-            for name, window in (
-                ("temporal_ensemble_window", self.temporal_ensemble_window),
-                ("temporal_ensemble_post_grasp_window", self.temporal_ensemble_post_grasp_window),
-            ):
-                if window is not None and not 1 <= window <= self.n_action_steps:
-                    raise ValueError(f"`{name}` must be between 1 and n_action_steps.")
-            for name, steps in (
-                ("temporal_ensemble_replan_steps", self.temporal_ensemble_replan_steps),
-                (
-                    "temporal_ensemble_post_grasp_replan_steps",
-                    self.temporal_ensemble_post_grasp_replan_steps,
-                ),
-            ):
-                if steps is not None and not 1 <= steps <= self.n_action_steps:
-                    raise ValueError(f"`{name}` must be between 1 and n_action_steps.")
-            if (self.temporal_ensemble_post_grasp_window is None) != (
-                self.temporal_ensemble_post_grasp_replan_steps is None
+            if self.temporal_ensemble_replan_steps is not None and not (
+                1 <= self.temporal_ensemble_replan_steps <= self.n_action_steps
             ):
                 raise ValueError(
-                    "post-grasp DP ensembling requires both a window and replan-step count."
-                )
-            pre_window = self.temporal_ensemble_window or self.n_action_steps
-            pre_steps = self.temporal_ensemble_replan_steps or self.n_action_steps
-            if pre_steps > pre_window:
-                raise ValueError(
-                    "DP replan steps cannot exceed the ensemble window; otherwise requested "
-                    "actions have no eligible prediction."
-                )
-            if (
-                self.temporal_ensemble_post_grasp_window is not None
-                and self.temporal_ensemble_post_grasp_replan_steps
-                > self.temporal_ensemble_post_grasp_window
-            ):
-                raise ValueError(
-                    "DP post-grasp replan steps cannot exceed the post-grasp ensemble window."
+                    "`temporal_ensemble_replan_steps` must be between 1 and n_action_steps."
                 )
             if (
                 self.temporal_ensemble_inference_deadline_ms is not None
                 and self.temporal_ensemble_inference_deadline_ms <= 0
             ):
                 raise ValueError("`temporal_ensemble_inference_deadline_ms` must be positive.")
-            if self.temporal_ensemble_post_grasp_window is not None:
-                if self.temporal_ensemble_gripper_index < 0:
-                    raise ValueError("`temporal_ensemble_gripper_index` must be non-negative.")
-                if self.temporal_ensemble_min_open_excursion <= 0:
-                    raise ValueError("`temporal_ensemble_min_open_excursion` must be positive.")
-                if not (
-                    0
-                    < self.temporal_ensemble_close_fraction
-                    < self.temporal_ensemble_reopen_fraction
-                    < 1
-                ):
-                    raise ValueError(
-                        "Require 0 < temporal_ensemble_close_fraction < "
-                        "temporal_ensemble_reopen_fraction < 1."
-                    )
-                if self.temporal_ensemble_phase_stable_steps <= 0:
-                    raise ValueError("`temporal_ensemble_phase_stable_steps` must be positive.")
-                if self.temporal_ensemble_phase_stable_delta_fraction <= 0:
-                    raise ValueError(
-                        "`temporal_ensemble_phase_stable_delta_fraction` must be positive."
-                    )
 
         if self.resize_shape is not None and (
             len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)

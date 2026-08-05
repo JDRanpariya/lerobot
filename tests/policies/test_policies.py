@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import inspect
-import json
 from copy import deepcopy
 from pathlib import Path
 
@@ -28,7 +27,6 @@ from packaging import version
 from safetensors.torch import load_file
 
 from lerobot.configs.default import DatasetConfig
-from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets import make_dataset
@@ -36,7 +34,7 @@ from lerobot.envs.factory import make_env, make_env_config
 from lerobot.envs.utils import close_envs, preprocess_observation
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act.modeling_act import ACTPolicy, ACTTemporalEnsembler
+from lerobot.policies.act.modeling_act import ACTTemporalEnsembler
 from lerobot.policies.factory import (
     get_policy_class,
     make_policy,
@@ -482,192 +480,6 @@ def test_act_temporal_ensembler():
         assert torch.all(offline_avg <= einops.reduce(seq_slice, "b s 1 -> b 1", "max"))
         # Selected atol=1e-4 keeping in mind actions in [-1, 1] and excepting 0.01% error.
         torch.testing.assert_close(online_avg, offline_avg, rtol=1e-4, atol=1e-4)
-
-
-def test_act_temporal_ensembler_recent_window():
-    """A finite window must match an explicit average over only recent overlapping chunks."""
-    temporal_ensemble_coeff = 0.01
-    chunk_size = 8
-    temporal_ensemble_window = 3
-    episode_length = 12
-    ensembler = ACTTemporalEnsembler(
-        temporal_ensemble_coeff,
-        chunk_size,
-        temporal_ensemble_window=temporal_ensemble_window,
-    )
-    with seeded_context(1):
-        batch_seq = torch.rand(2, episode_length, chunk_size, 3, dtype=torch.float64)
-    weights = torch.exp(
-        -temporal_ensemble_coeff * torch.arange(temporal_ensemble_window, dtype=batch_seq.dtype)
-    )
-
-    for step in range(episode_length):
-        online_avg = ensembler.update(batch_seq[:, step])
-        n_predictions = min(step + 1, temporal_ensemble_window)
-        episode_steps = torch.arange(step + 1)[-n_predictions:]
-        chunk_indices = torch.arange(n_predictions - 1, -1, -1)
-        predictions = batch_seq[:, episode_steps, chunk_indices]
-        offline_avg = (predictions * weights[:n_predictions].view(1, n_predictions, 1)).sum(dim=1) / weights[
-            :n_predictions
-        ].sum()
-        torch.testing.assert_close(online_avg, offline_avg)
-
-
-def test_act_temporal_ensembler_recent_window_reset():
-    ensembler = ACTTemporalEnsembler(0.01, 5, temporal_ensemble_window=3)
-    first_chunk = torch.arange(5, dtype=torch.float32).view(1, 5, 1)
-    ensembler.update(first_chunk)
-    ensembler.update(first_chunk + 10)
-    ensembler.reset()
-    reset_chunk = first_chunk + 20
-    torch.testing.assert_close(ensembler.update(reset_chunk), reset_chunk[:, 0])
-
-
-def test_act_temporal_ensembler_window_one_uses_current_prediction_only():
-    ensembler = ACTTemporalEnsembler(0.01, 5, temporal_ensemble_window=1)
-    with seeded_context(3):
-        chunks = torch.rand(2, 8, 5, 3)
-
-    for step in range(chunks.shape[1]):
-        torch.testing.assert_close(ensembler.update(chunks[:, step]), chunks[:, step, 0])
-
-
-def test_act_temporal_ensembler_chunk_sized_window_matches_full_history():
-    chunk_size = 50
-    full = ACTTemporalEnsembler(0.01, chunk_size)
-    bounded = ACTTemporalEnsembler(0.01, chunk_size, temporal_ensemble_window=chunk_size)
-    with seeded_context(2):
-        chunks = torch.rand(1, 900, chunk_size, 6)
-
-    for step in range(chunks.shape[1]):
-        torch.testing.assert_close(
-            full.update(chunks[:, step]),
-            bounded.update(chunks[:, step]),
-            rtol=1e-4,
-            atol=1e-4,
-        )
-
-
-@pytest.mark.parametrize("window", [0, 6])
-def test_act_temporal_ensembler_rejects_invalid_recent_window(window):
-    with pytest.raises(ValueError, match="between 1 and chunk_size"):
-        ACTTemporalEnsembler(0.01, 5, temporal_ensemble_window=window)
-
-
-def test_act_config_requires_temporal_ensemble_for_recent_window():
-    with pytest.raises(ValueError, match="requires `temporal_ensemble_coeff`"):
-        ACTConfig(chunk_size=50, n_action_steps=1, temporal_ensemble_window=10)
-
-
-def test_act_config_rejects_recent_window_larger_than_chunk():
-    with pytest.raises(ValueError, match="between 1 and `chunk_size`"):
-        ACTConfig(
-            chunk_size=50,
-            n_action_steps=1,
-            temporal_ensemble_coeff=0.01,
-            temporal_ensemble_window=51,
-        )
-
-
-def test_act_policy_wires_recent_window_from_config(monkeypatch):
-    captured = {}
-
-    class SpyEnsembler:
-        def __init__(
-            self,
-            coeff,
-            chunk_size,
-            temporal_ensemble_window=None,
-            cache_full_history=False,
-        ):
-            captured.update(
-                coeff=coeff,
-                chunk_size=chunk_size,
-                temporal_ensemble_window=temporal_ensemble_window,
-                cache_full_history=cache_full_history,
-            )
-
-        def reset(self):
-            captured["reset"] = True
-
-    monkeypatch.setattr("lerobot.policies.act.modeling_act.ACTTemporalEnsembler", SpyEnsembler)
-    monkeypatch.setattr("lerobot.policies.act.modeling_act.ACT", lambda _config: torch.nn.Identity())
-    config = ACTConfig(
-        chunk_size=50,
-        n_action_steps=1,
-        temporal_ensemble_coeff=0.01,
-        temporal_ensemble_window=10,
-        input_features={
-            f"{OBS_IMAGES}.top": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 96, 96)),
-            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(6,)),
-        },
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(6,))},
-    )
-
-    policy = ACTPolicy(config)
-
-    assert isinstance(policy.temporal_ensembler, SpyEnsembler)
-    assert captured == {
-        "coeff": 0.01,
-        "chunk_size": 50,
-        "temporal_ensemble_window": 10,
-        "cache_full_history": False,
-        "reset": True,
-    }
-
-
-def test_act_temporal_ensembler_runtime_reweight_preserves_full_history():
-    chunks = torch.stack([torch.arange(8, dtype=torch.float32) + 100 * step for step in range(4)]).view(
-        1, 4, 8, 1
-    )
-    ensembler = ACTTemporalEnsembler(0.01, 8, cache_full_history=True)
-    for step in range(3):
-        ensembler.update(chunks[:, step])
-
-    ensembler.set_runtime_parameters(
-        temporal_ensemble_coeff=0.0,
-        temporal_ensemble_window=None,
-    )
-    output = ensembler.update(chunks[:, 3])
-    # Current-step diagonal: 3, 102, 201, 300. Reweighting to zero
-    # is uniform and must keep all four predictions rather than reset.
-    torch.testing.assert_close(output, torch.tensor([[151.5]]))
-
-
-def test_act_temporal_ensembler_cached_full_matches_optimized_full():
-    optimized = ACTTemporalEnsembler(0.01, 50)
-    cached = ACTTemporalEnsembler(0.01, 50, cache_full_history=True)
-    with seeded_context(4):
-        chunks = torch.rand(2, 120, 50, 6)
-    for step in range(chunks.shape[1]):
-        torch.testing.assert_close(
-            cached.update(chunks[:, step]),
-            optimized.update(chunks[:, step]),
-            rtol=1e-4,
-            atol=1e-4,
-        )
-
-
-def test_act_config_recent_window_round_trip_and_legacy_default(tmp_path):
-    config = ACTConfig(
-        chunk_size=50,
-        n_action_steps=1,
-        temporal_ensemble_coeff=0.01,
-        temporal_ensemble_window=10,
-    )
-    config._save_pretrained(tmp_path)
-
-    restored = PreTrainedConfig.from_pretrained(tmp_path)
-    assert isinstance(restored, ACTConfig)
-    assert restored.temporal_ensemble_window == 10
-
-    config_path = tmp_path / "config.json"
-    legacy_payload = json.loads(config_path.read_text())
-    legacy_payload.pop("temporal_ensemble_window")
-    config_path.write_text(json.dumps(legacy_payload))
-    legacy = PreTrainedConfig.from_pretrained(tmp_path)
-    assert isinstance(legacy, ACTConfig)
-    assert legacy.temporal_ensemble_window is None
 
 
 def test_vqbet_discretize_keeps_buffers_on_device():

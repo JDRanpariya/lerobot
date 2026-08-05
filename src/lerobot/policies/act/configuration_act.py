@@ -76,13 +76,8 @@ class ACTConfig(PreTrainedConfig):
             ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
             1 when using this feature, as inference needs to happen at every step to form an ensemble. For
             more information on how ensembling works, please see `ACTTemporalEnsembler`.
-        temporal_ensemble_window: Optional maximum number of recent overlapping chunk predictions included
-            in each temporal ensemble. Defaults to None, which preserves the original ACT behavior of using
-            every prediction still overlapping the current step (up to `chunk_size`). This option requires
-            `temporal_ensemble_coeff` and does not change how often the policy is queried.
-        temporal_ensemble_post_grasp_coeff: Optional coefficient used after the calibrated grasp transition.
-            Unlike a hard recent-history window, changing this coefficient retains all aligned chunk predictions
-            and only changes their relative weights. Defaults to None, which keeps `temporal_ensemble_coeff`.
+        temporal_ensemble_disable_after_grasp: Whether to leave temporal ensembling after the calibrated
+            grasp transition and execute the checkpoint's complete, ordinary unensembled action chunk.
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
@@ -125,18 +120,10 @@ class ACTConfig(PreTrainedConfig):
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
-    # None preserves the upstream full-overlap ensemble. A finite value drops
-    # predictions older than this many control steps while still re-planning
-    # every step and blending the retained predictions.
-    temporal_ensemble_window: int | None = None
-    # Optional phase-adaptive deployment: keep the ordinary ensemble before a
-    # completed grasp, then reset it and use this window after the gripper's
-    # causal open-close cycle is detected.
-    temporal_ensemble_post_grasp_window: int | None = None
-    # Prefer this soft, full-history reweighting for phase-adaptive execution.
-    # A hard short window also removes the late indices of every 50-step ACT
-    # plan and can attenuate motion for checkpoints trained at chunk_size=50.
-    temporal_ensemble_post_grasp_coeff: float | None = None
+    # Switch completely out of temporal ensembling after grasp and execute this
+    # many actions from each fresh chunk. This is distinct from coeff=0, which
+    # still averages all overlapping predictions uniformly.
+    temporal_ensemble_disable_after_grasp: bool = False
     temporal_ensemble_gripper_index: int = 5
     temporal_ensemble_min_open_excursion: float = 0.25
     temporal_ensemble_close_fraction: float = 0.5
@@ -288,34 +275,19 @@ class ACTConfig(PreTrainedConfig):
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
                 "because the policy needs to be queried every step to compute the ensembled action."
             )
-        if self.temporal_ensemble_window is not None:
-            if self.temporal_ensemble_coeff is None:
+        if self.temporal_ensemble_coeff is not None:
+            if not math.isfinite(self.temporal_ensemble_coeff):
+                raise ValueError("`temporal_ensemble_coeff` must be finite.")
+            if -self.temporal_ensemble_coeff * (self.chunk_size - 1) > 80:
                 raise ValueError(
-                    "`temporal_ensemble_window` requires `temporal_ensemble_coeff` because "
-                    "there is no temporal ensemble to bound otherwise."
+                    "Negative `temporal_ensemble_coeff` is too large for stable float32 weights."
                 )
-            if not 1 <= self.temporal_ensemble_window <= self.chunk_size:
-                raise ValueError(
-                    "`temporal_ensemble_window` must be between 1 and `chunk_size`. Got "
-                    f"{self.temporal_ensemble_window} for a chunk size of {self.chunk_size}."
-                )
-        dynamic_temporal_ensemble = (
-            self.temporal_ensemble_post_grasp_window is not None
-            or self.temporal_ensemble_post_grasp_coeff is not None
-        )
-        if dynamic_temporal_ensemble:
-            if self.temporal_ensemble_coeff is None:
-                raise ValueError("Phase-adaptive temporal ensembling requires `temporal_ensemble_coeff`.")
-            if self.temporal_ensemble_post_grasp_coeff is not None and not math.isfinite(
-                self.temporal_ensemble_post_grasp_coeff
-            ):
-                raise ValueError("`temporal_ensemble_post_grasp_coeff` must be finite.")
-        if self.temporal_ensemble_post_grasp_window is not None and not (
-            1 <= self.temporal_ensemble_post_grasp_window <= self.chunk_size
-        ):
+        dynamic_temporal_ensemble = self.temporal_ensemble_disable_after_grasp
+        if dynamic_temporal_ensemble and self.temporal_ensemble_coeff is None:
+            raise ValueError("Phase-adaptive temporal ensembling requires `temporal_ensemble_coeff`.")
+        if dynamic_temporal_ensemble and self.temporal_ensemble_coeff != 0.01:
             raise ValueError(
-                "`temporal_ensemble_post_grasp_window` must be between 1 and `chunk_size`. Got "
-                f"{self.temporal_ensemble_post_grasp_window} for chunk_size={self.chunk_size}."
+                "Phase-adaptive TE-to-no-TE execution requires `temporal_ensemble_coeff=0.01`."
             )
         if dynamic_temporal_ensemble:
             if self.temporal_ensemble_gripper_index < 0:

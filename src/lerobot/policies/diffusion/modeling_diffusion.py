@@ -43,8 +43,8 @@ else:
     DDIMScheduler = None
     DDPMScheduler = None
 
+from ..phase_adaptive import ChunkTemporalEnsembler
 from ..pretrained import PreTrainedPolicy
-from ..phase_adaptive import ChunkTemporalEnsembler, GripperCyclePhaseDetector
 from ..utils import (
     get_device_from_parameters,
     get_dtype_from_parameters,
@@ -86,27 +86,11 @@ class DiffusionPolicy(PreTrainedPolicy):
         self.diffusion = DiffusionModel(config)
 
         self.temporal_ensembler = None
-        self.temporal_ensemble_phase_detector = None
         if self.config.temporal_ensemble_coeff is not None:
-            pre_grasp_window = (
-                self.config.temporal_ensemble_window or self.config.n_action_steps
-            )
             self.temporal_ensembler = ChunkTemporalEnsembler(
                 self.config.temporal_ensemble_coeff,
                 self.config.n_action_steps,
-                temporal_ensemble_window=pre_grasp_window,
             )
-            if self.config.temporal_ensemble_post_grasp_window is not None:
-                self.temporal_ensemble_phase_detector = GripperCyclePhaseDetector(
-                    gripper_index=self.config.temporal_ensemble_gripper_index,
-                    min_open_excursion=self.config.temporal_ensemble_min_open_excursion,
-                    close_fraction=self.config.temporal_ensemble_close_fraction,
-                    reopen_fraction=self.config.temporal_ensemble_reopen_fraction,
-                    stable_steps=self.config.temporal_ensemble_phase_stable_steps,
-                    stable_delta_fraction=(
-                        self.config.temporal_ensemble_phase_stable_delta_fraction
-                    ),
-                )
 
         self.reset()
 
@@ -135,11 +119,7 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._active_replan_steps = (
                 self.config.temporal_ensemble_replan_steps or self.config.n_action_steps
             )
-            self.temporal_ensembler.set_window(
-                self.config.temporal_ensemble_window or self.config.n_action_steps
-            )
-            if self.temporal_ensemble_phase_detector is not None:
-                self.temporal_ensemble_phase_detector.reset()
+            self.temporal_ensembler.reset()
         self._last_inference_ms: float | None = None
 
     def _update_current_history(self, state: Tensor) -> Tensor:
@@ -203,25 +183,6 @@ class DiffusionPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, batch)
         if self.config.proprio_temporal_encoder == "joint_cnn":
             self._current_history_window = self._update_current_history(batch[OBS_STATE])
-
-        if self.temporal_ensemble_phase_detector is not None:
-            phase = self.temporal_ensemble_phase_detector.update(batch[OBS_STATE])
-            if phase.changed:
-                # Do not execute any action predicted under the old phase.
-                self._queues[ACTION].clear()
-                if phase.post_grasp:
-                    window = self.config.temporal_ensemble_post_grasp_window
-                    self._active_replan_steps = (
-                        self.config.temporal_ensemble_post_grasp_replan_steps
-                    )
-                else:
-                    window = self.config.temporal_ensemble_window or self.config.n_action_steps
-                    self._active_replan_steps = (
-                        self.config.temporal_ensemble_replan_steps
-                        or self.config.n_action_steps
-                    )
-                assert window is not None and self._active_replan_steps is not None
-                self.temporal_ensembler.set_window(window)
 
         if len(self._queues[ACTION]) == 0:
             deadline = self.config.temporal_ensemble_inference_deadline_ms

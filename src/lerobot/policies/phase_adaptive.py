@@ -167,39 +167,25 @@ class ChunkTemporalEnsembler:
     supports policies that replan every ``R > 1`` control steps. Each retained
     chunk carries its age in control steps. At a replan, future action ``j`` is
     blended from each chunk at index ``age + j``. Predictions whose age reaches
-    the configured control-step window or the chunk length are excluded.
+    the chunk length are excluded.
     """
 
     def __init__(
         self,
         temporal_ensemble_coeff: float,
         chunk_size: int,
-        temporal_ensemble_window: int | None = None,
     ) -> None:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
-        if temporal_ensemble_window is not None and not 1 <= temporal_ensemble_window <= chunk_size:
-            raise ValueError(
-                "temporal_ensemble_window must be between 1 and chunk_size; got "
-                f"{temporal_ensemble_window} for chunk_size={chunk_size}."
-            )
         self.temporal_ensemble_coeff = temporal_ensemble_coeff
         self.chunk_size = chunk_size
-        self.temporal_ensemble_window = temporal_ensemble_window
         self.reset()
 
     def reset(self) -> None:
         self._history: deque[_ChunkPrediction] = deque()
 
-    def set_window(self, window: int | None) -> None:
-        if window is not None and not 1 <= window <= self.chunk_size:
-            raise ValueError(f"window must be between 1 and {self.chunk_size}; got {window}")
-        self.temporal_ensemble_window = window
-        self.reset()
-
     def _retained(self) -> list[_ChunkPrediction]:
-        window = self.temporal_ensemble_window or self.chunk_size
-        return [entry for entry in self._history if entry.age < window and entry.age < self.chunk_size]
+        return [entry for entry in self._history if entry.age < self.chunk_size]
 
     def update(self, actions: Tensor, output_steps: int) -> Tensor:
         if actions.ndim != 3 or actions.shape[1] != self.chunk_size:
@@ -214,14 +200,12 @@ class ChunkTemporalEnsembler:
         retained = self._retained()
         self._history = deque(retained)
         outputs = []
-        window = self.temporal_ensemble_window or self.chunk_size
 
         for future_offset in range(output_steps):
             eligible = [
                 entry
                 for entry in retained
                 if entry.age + future_offset < self.chunk_size
-                and entry.age + future_offset < window
             ]
             if not eligible:
                 raise RuntimeError("no chunk predicts a requested output action")
