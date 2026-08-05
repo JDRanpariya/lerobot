@@ -19,7 +19,9 @@ As per Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware (https
 The majority of changes here involve removing unused code, unifying naming, and adding helpful comments.
 """
 
+import logging
 import math
+import os
 from collections import deque
 from collections.abc import Callable
 from itertools import chain
@@ -40,6 +42,8 @@ from ..pretrained import PreTrainedPolicy
 from .configuration_act import ACTConfig
 from .fusion_modules import build_fusion_module
 from .temporal_encoders import build_temporal_encoder
+
+logger = logging.getLogger(__name__)
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -115,6 +119,7 @@ class ACTPolicy(PreTrainedPolicy):
                 self.temporal_ensemble_phase_detector.reset()
                 self._post_grasp_open_loop = False
                 self._action_queue = deque([], maxlen=self.config.chunk_size)
+                self._dyn_step = 0  # per-episode step counter for gate logging
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
@@ -159,7 +164,34 @@ class ACTPolicy(PreTrainedPolicy):
         if self.config.temporal_ensemble_coeff is not None:
             if self.temporal_ensemble_phase_detector is not None:
                 phase = self.temporal_ensemble_phase_detector.update(batch[OBS_STATE])
+                self._dyn_step = getattr(self, "_dyn_step", 0) + 1
+                det = self.temporal_ensemble_phase_detector
+                # Opt-in detector trace: set PHASE_GATE_DEBUG=1. Emits ONLY when the
+                # detector's discrete state changes (arming flip, candidate-run
+                # start/reset) -- never once per control step, because logging at
+                # 30 Hz is unreadable and measurably slows the control loop.
+                if os.environ.get("PHASE_GATE_DEBUG"):
+                    armed = det._opening_direction is not None
+                    signature = (armed, det._candidate_steps > 0, self._post_grasp_open_loop)
+                    if signature != getattr(self, "_dyn_last_sig", None):
+                        self._dyn_last_sig = signature
+                        peak = float(det._peak_excursion) if det._peak_excursion is not None else 0.0
+                        logger.info(
+                            "[phase-gate] step=%d grip=%+.3f armed=%s peak_exc=%.3f "
+                            "(arms at %.3f) cand=%d/%d",
+                            self._dyn_step,
+                            float(batch[OBS_STATE][0, det.gripper_index]),
+                            armed, peak, det.min_open_excursion,
+                            det._candidate_steps, det.stable_steps,
+                        )
                 if phase.changed and phase.post_grasp and not self._post_grasp_open_loop:
+                    # One line per episode: the latch is one-way, so this must appear
+                    # exactly once. Its absence means the grasp was never detected.
+                    logger.info(
+                        "[phase-gate] LATCH at step=%d -> POST_GRASP "
+                        "(open-loop full chunk, one-way)",
+                        self._dyn_step,
+                    )
                     # Never execute an action predicted under the controller
                     # used before the grasp boundary. This is deliberately a
                     # one-way episode latch: release must not resume TE.
