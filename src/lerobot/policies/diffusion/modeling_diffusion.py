@@ -21,6 +21,7 @@ TODO(alexander-soare):
 """
 
 import math
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -43,6 +44,7 @@ else:
     DDPMScheduler = None
 
 from ..pretrained import PreTrainedPolicy
+from ..phase_adaptive import ChunkTemporalEnsembler, GripperCyclePhaseDetector
 from ..utils import (
     get_device_from_parameters,
     get_dtype_from_parameters,
@@ -83,6 +85,29 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         self.diffusion = DiffusionModel(config)
 
+        self.temporal_ensembler = None
+        self.temporal_ensemble_phase_detector = None
+        if self.config.temporal_ensemble_coeff is not None:
+            pre_grasp_window = (
+                self.config.temporal_ensemble_window or self.config.n_action_steps
+            )
+            self.temporal_ensembler = ChunkTemporalEnsembler(
+                self.config.temporal_ensemble_coeff,
+                self.config.n_action_steps,
+                temporal_ensemble_window=pre_grasp_window,
+            )
+            if self.config.temporal_ensemble_post_grasp_window is not None:
+                self.temporal_ensemble_phase_detector = GripperCyclePhaseDetector(
+                    gripper_index=self.config.temporal_ensemble_gripper_index,
+                    min_open_excursion=self.config.temporal_ensemble_min_open_excursion,
+                    close_fraction=self.config.temporal_ensemble_close_fraction,
+                    reopen_fraction=self.config.temporal_ensemble_reopen_fraction,
+                    stable_steps=self.config.temporal_ensemble_phase_stable_steps,
+                    stable_delta_fraction=(
+                        self.config.temporal_ensemble_phase_stable_delta_fraction
+                    ),
+                )
+
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -98,12 +123,49 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+        # This is deliberately separate from the n_obs_steps state queue.
+        # It stores normalized observations so inference constructs exactly
+        # the same [S, K+1, J] histories as TemporalWindowDataset training.
+        if self.config.proprio_temporal_encoder == "joint_cnn":
+            self._current_history = deque(
+                maxlen=self.config.proprio_K + self.config.n_obs_steps
+            )
+            self._current_history_window = None
+        if self.temporal_ensembler is not None:
+            self._active_replan_steps = (
+                self.config.temporal_ensemble_replan_steps or self.config.n_action_steps
+            )
+            self.temporal_ensembler.set_window(
+                self.config.temporal_ensemble_window or self.config.n_action_steps
+            )
+            if self.temporal_ensemble_phase_detector is not None:
+                self.temporal_ensemble_phase_detector.reset()
+        self._last_inference_ms: float | None = None
+
+    def _update_current_history(self, state: Tensor) -> Tensor:
+        """Return normalized DP current histories shaped [B, S, K+1, J]."""
+        if self.config.proprio_temporal_encoder != "joint_cnn":
+            raise RuntimeError("Current history requested without the joint_cnn encoder.")
+        self._current_history.append(state)
+        required = self.config.proprio_K + self.config.n_obs_steps
+        while len(self._current_history) < required:
+            self._current_history.appendleft(torch.zeros_like(state))
+        history = torch.stack(list(self._current_history), dim=1)
+        windows = torch.stack(
+            [history[:, offset : offset + self.config.proprio_K + 1] for offset in range(self.config.n_obs_steps)],
+            dim=1,
+        )
+        return windows[..., self.config.proprio_current_indices]
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         # stack n latest observations from the queue
         batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        if self.config.proprio_temporal_encoder == "joint_cnn":
+            if self._current_history_window is None:
+                raise RuntimeError("joint_cnn history was not populated before DP chunk prediction.")
+            batch["observation.state_window"] = self._current_history_window
         actions = self.diffusion.generate_actions(batch, noise=noise)
 
         return actions
@@ -139,12 +201,67 @@ class DiffusionPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         # NOTE: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
+        if self.config.proprio_temporal_encoder == "joint_cnn":
+            self._current_history_window = self._update_current_history(batch[OBS_STATE])
+
+        if self.temporal_ensemble_phase_detector is not None:
+            phase = self.temporal_ensemble_phase_detector.update(batch[OBS_STATE])
+            if phase.changed:
+                # Do not execute any action predicted under the old phase.
+                self._queues[ACTION].clear()
+                if phase.post_grasp:
+                    window = self.config.temporal_ensemble_post_grasp_window
+                    self._active_replan_steps = (
+                        self.config.temporal_ensemble_post_grasp_replan_steps
+                    )
+                else:
+                    window = self.config.temporal_ensemble_window or self.config.n_action_steps
+                    self._active_replan_steps = (
+                        self.config.temporal_ensemble_replan_steps
+                        or self.config.n_action_steps
+                    )
+                assert window is not None and self._active_replan_steps is not None
+                self.temporal_ensembler.set_window(window)
 
         if len(self._queues[ACTION]) == 0:
-            actions = self.predict_action_chunk(batch, noise=noise)
-            self._queues[ACTION].extend(actions.transpose(0, 1))
+            deadline = self.config.temporal_ensemble_inference_deadline_ms
+            if deadline is None:
+                # Preserve the legacy inference path: no CUDA synchronization
+                # or timing overhead unless the development cutoff is enabled.
+                actions = self.predict_action_chunk(batch, noise=noise)
+                self._last_inference_ms = None
+            else:
+                diffusion = getattr(self, "diffusion", None)
+                inference_parameter = (
+                    next(diffusion.parameters(), None) if diffusion is not None else None
+                )
+                inference_device = (
+                    inference_parameter.device if inference_parameter is not None else None
+                )
+                if inference_device is not None and inference_device.type == "cuda":
+                    torch.cuda.synchronize(inference_device)
+                started = time.perf_counter()
+                actions = self.predict_action_chunk(batch, noise=noise)
+                if inference_device is not None and inference_device.type == "cuda":
+                    torch.cuda.synchronize(inference_device)
+                self._last_inference_ms = (time.perf_counter() - started) * 1000.0
+                if self._last_inference_ms > deadline:
+                    raise RuntimeError(
+                        "Diffusion inference missed the development deadline: "
+                        f"{self._last_inference_ms:.1f} ms > {deadline:.1f} ms. "
+                        "No actions from this prediction were queued."
+                    )
+            if self.temporal_ensembler is None:
+                queued_actions = actions
+            else:
+                queued_actions = self.temporal_ensembler.update(
+                    actions, output_steps=self._active_replan_steps
+                )
+            self._queues[ACTION].extend(queued_actions.transpose(0, 1))
 
         action = self._queues[ACTION].popleft()
+        if self.temporal_ensembler is not None:
+            self.temporal_ensembler.advance()
         return action
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
@@ -175,13 +292,103 @@ def _make_noise_scheduler(name: str, **kwargs: dict):
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
 
+class DiffusionJointCurrentEncoder(nn.Module):
+    """Shared per-joint temporal CNN for DP current histories.
+
+    The input is deliberately four-dimensional: [batch, observation step,
+    history step, joint].  Each joint is encoded independently with the same
+    convolutional weights; identities are retained by the fixed concatenation
+    order in the DP global condition.  Unlike the historical direct-concat
+    path, raw current never reaches the U-Net condition.
+    """
+
+    def __init__(self, config: DiffusionConfig):
+        super().__init__()
+        self.history_steps = config.proprio_K + 1
+        self.n_joints = len(config.proprio_current_indices)
+        self.pooling = config.proprio_cnn_pooling
+
+        layers: list[nn.Module] = []
+        in_channels = 1
+        for channels, kernel_size, dilation in zip(
+            config.proprio_cnn_channels,
+            config.proprio_cnn_kernel_sizes,
+            config.proprio_cnn_dilations,
+            strict=True,
+        ):
+            layers.extend(
+                [
+                    nn.Conv1d(
+                        in_channels,
+                        channels,
+                        kernel_size=kernel_size,
+                        dilation=dilation,
+                        padding=(kernel_size - 1) * dilation // 2,
+                    ),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+            in_channels = channels
+        self.cnn = nn.Sequential(*layers)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        pool_factor = 1 if self.pooling == "mean" else 3
+        self.projection = nn.Linear(in_channels * pool_factor, config.proprio_cnn_embedding_dim)
+
+    def forward(self, history: Tensor) -> Tensor:
+        """Encode ``[B, S, K+1, J]`` current history to ``[B, S, J, E]``."""
+        if history.ndim != 4:
+            raise ValueError(
+                "DiffusionJointCurrentEncoder expects [B, S, K+1, J], "
+                f"got {tuple(history.shape)}."
+            )
+        batch_size, n_observations, history_steps, n_joints = history.shape
+        if history_steps != self.history_steps or n_joints != self.n_joints:
+            raise ValueError(
+                "DiffusionJointCurrentEncoder expected history shape (*, *, "
+                f"{self.history_steps}, {self.n_joints}), got {tuple(history.shape)}."
+            )
+        # [B,S,T,J] -> [B*S*J,1,T].  This is the only point currents meet
+        # learned weights; the CNN's batch axis prevents cross-joint mixing.
+        x = history.permute(0, 1, 3, 2).reshape(batch_size * n_observations * n_joints, 1, history_steps)
+        features = self.cnn(x)
+        if self.pooling == "mean":
+            summary = self.global_pool(features).squeeze(-1)
+        elif self.pooling == "mean_max_latest":
+            summary = torch.cat(
+                (features.mean(dim=-1), features.amax(dim=-1), features[..., -1]), dim=-1
+            )
+        else:  # Config validation makes this unreachable; retain local guard for direct unit use.
+            raise ValueError(f"Unknown joint-CNN pooling mode: {self.pooling!r}")
+        embedding = self.projection(summary)
+        return embedding.view(batch_size, n_observations, n_joints, -1)
+
+
 class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         self.config = config
 
         # Build observation encoders (depending on which observations are provided).
-        global_cond_dim = self.config.robot_state_feature.shape[0]
+        state_dim = self.config.robot_state_feature.shape[0]
+        self.current_encoder = None
+        self.position_indices: list[int] | None = None
+        if self.config.proprio_temporal_encoder == "joint_cnn":
+            current_indices = list(self.config.proprio_current_indices)
+            if len(set(current_indices)) != len(current_indices) or max(current_indices) >= state_dim:
+                raise ValueError(
+                    "joint_cnn current indices must be unique and within observation.state dimensions."
+                )
+            self.position_indices = [index for index in range(state_dim) if index not in current_indices]
+            if not self.position_indices:
+                raise ValueError("joint_cnn requires at least one non-current state channel.")
+            self.current_encoder = DiffusionJointCurrentEncoder(self.config)
+            global_cond_dim = len(self.position_indices) + (
+                len(current_indices) * self.config.proprio_cnn_embedding_dim
+            )
+        else:
+            # Keep the legacy condition width and module structure bit-for-bit
+            # compatible with existing DP checkpoints.
+            global_cond_dim = state_dim
         if self.config.image_features:
             num_images = len(self.config.image_features)
             if self.config.use_separate_rgb_encoder_per_camera:
@@ -257,7 +464,30 @@ class DiffusionModel(nn.Module):
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-        global_cond_feats = [batch[OBS_STATE]]
+        if self.current_encoder is None:
+            global_cond_feats = [batch[OBS_STATE]]
+        else:
+            window = batch.get("observation.state_window")
+            if window is None:
+                raise KeyError(
+                    "Diffusion joint_cnn requires observation.state_window with [B, S, K+1, J]."
+                )
+            expected = (
+                batch_size,
+                n_obs_steps,
+                self.config.proprio_K + 1,
+                len(self.config.proprio_current_indices),
+            )
+            if tuple(window.shape) != expected:
+                raise ValueError(
+                    "Diffusion joint_cnn expected observation.state_window shape "
+                    f"{expected}, got {tuple(window.shape)}."
+                )
+            positions = batch[OBS_STATE][..., self.position_indices]
+            effort = self.current_encoder(window).flatten(start_dim=-2)
+            # No raw current is included here: all current influence must pass
+            # through the shared per-joint temporal encoder.
+            global_cond_feats = [positions, effort]
         # Extract image features.
         if self.config.image_features:
             if self.config.use_separate_rgb_encoder_per_camera:

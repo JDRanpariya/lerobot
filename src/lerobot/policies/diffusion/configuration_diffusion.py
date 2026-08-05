@@ -132,6 +132,18 @@ class DiffusionConfig(PreTrainedConfig):
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
+
+    # Optional learned effort path. `joint_cnn` removes raw current from the
+    # ordinary state condition and encodes one K+1 history per joint with a
+    # shared temporal CNN before fixed-order global conditioning.
+    proprio_temporal_encoder: str = "none"  # none | joint_cnn
+    proprio_K: int = 9
+    proprio_current_indices: list[int] = field(default_factory=lambda: [6, 7, 8, 9, 10, 11])
+    proprio_cnn_channels: list[int] = field(default_factory=lambda: [16, 16, 8])
+    proprio_cnn_kernel_sizes: list[int] = field(default_factory=lambda: [3, 3, 3])
+    proprio_cnn_dilations: list[int] = field(default_factory=lambda: [1, 2, 4])
+    proprio_cnn_pooling: str = "mean"
+    proprio_cnn_embedding_dim: int = 8
     # Noise scheduler.
     noise_scheduler_type: str = "DDPM"
     num_train_timesteps: int = 100
@@ -144,6 +156,23 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Inference
     num_inference_steps: int | None = None
+    # Experimental synchronous controller for offline/mechanical development.
+    # The thesis evaluator blocks robot rollout until asynchronous prediction
+    # prefetch and rollout-level safe stopping are implemented.
+    temporal_ensemble_coeff: float | None = None
+    temporal_ensemble_window: int | None = None
+    temporal_ensemble_replan_steps: int | None = None
+    temporal_ensemble_post_grasp_window: int | None = None
+    temporal_ensemble_post_grasp_replan_steps: int | None = None
+    # Optional model-inference cutoff for development. Raising here does not by
+    # itself establish a robot-level safe stop.
+    temporal_ensemble_inference_deadline_ms: float | None = None
+    temporal_ensemble_gripper_index: int = 5
+    temporal_ensemble_min_open_excursion: float = 0.25
+    temporal_ensemble_close_fraction: float = 0.5
+    temporal_ensemble_reopen_fraction: float = 0.8
+    temporal_ensemble_phase_stable_steps: int = 15
+    temporal_ensemble_phase_stable_delta_fraction: float = 0.02
 
     # Optimization
     compile_model: bool = False
@@ -180,6 +209,106 @@ class DiffusionConfig(PreTrainedConfig):
                 f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
                 f"Got {self.noise_scheduler_type}."
             )
+
+        if self.proprio_temporal_encoder not in {"none", "joint_cnn"}:
+            raise ValueError("`proprio_temporal_encoder` must be 'none' or 'joint_cnn'.")
+        if self.proprio_temporal_encoder == "joint_cnn":
+            if self.proprio_K <= 0:
+                raise ValueError("joint_cnn requires `proprio_K > 0`.")
+            if not self.proprio_current_indices:
+                raise ValueError("joint_cnn requires non-empty `proprio_current_indices`.")
+            if self.proprio_cnn_embedding_dim <= 0:
+                raise ValueError("`proprio_cnn_embedding_dim` must be positive.")
+            if len(self.proprio_cnn_channels) == 0:
+                raise ValueError("joint_cnn requires at least one CNN channel.")
+            if not (
+                len(self.proprio_cnn_channels)
+                == len(self.proprio_cnn_kernel_sizes)
+                == len(self.proprio_cnn_dilations)
+            ):
+                raise ValueError(
+                    "joint_cnn CNN channels, kernel sizes, and dilations must have equal lengths."
+                )
+            if any(index < 0 for index in self.proprio_current_indices):
+                raise ValueError("joint_cnn current indices must be non-negative.")
+        if self.proprio_cnn_pooling not in {"mean", "mean_max_latest"}:
+            raise ValueError(
+                "`proprio_cnn_pooling` must be 'mean' or 'mean_max_latest'."
+            )
+
+        if self.temporal_ensemble_coeff is None:
+            temporal_options = (
+                self.temporal_ensemble_window,
+                self.temporal_ensemble_replan_steps,
+                self.temporal_ensemble_post_grasp_window,
+                self.temporal_ensemble_post_grasp_replan_steps,
+                self.temporal_ensemble_inference_deadline_ms,
+            )
+            if any(value is not None for value in temporal_options):
+                raise ValueError("Diffusion temporal-ensemble options require `temporal_ensemble_coeff`.")
+        else:
+            for name, window in (
+                ("temporal_ensemble_window", self.temporal_ensemble_window),
+                ("temporal_ensemble_post_grasp_window", self.temporal_ensemble_post_grasp_window),
+            ):
+                if window is not None and not 1 <= window <= self.n_action_steps:
+                    raise ValueError(f"`{name}` must be between 1 and n_action_steps.")
+            for name, steps in (
+                ("temporal_ensemble_replan_steps", self.temporal_ensemble_replan_steps),
+                (
+                    "temporal_ensemble_post_grasp_replan_steps",
+                    self.temporal_ensemble_post_grasp_replan_steps,
+                ),
+            ):
+                if steps is not None and not 1 <= steps <= self.n_action_steps:
+                    raise ValueError(f"`{name}` must be between 1 and n_action_steps.")
+            if (self.temporal_ensemble_post_grasp_window is None) != (
+                self.temporal_ensemble_post_grasp_replan_steps is None
+            ):
+                raise ValueError(
+                    "post-grasp DP ensembling requires both a window and replan-step count."
+                )
+            pre_window = self.temporal_ensemble_window or self.n_action_steps
+            pre_steps = self.temporal_ensemble_replan_steps or self.n_action_steps
+            if pre_steps > pre_window:
+                raise ValueError(
+                    "DP replan steps cannot exceed the ensemble window; otherwise requested "
+                    "actions have no eligible prediction."
+                )
+            if (
+                self.temporal_ensemble_post_grasp_window is not None
+                and self.temporal_ensemble_post_grasp_replan_steps
+                > self.temporal_ensemble_post_grasp_window
+            ):
+                raise ValueError(
+                    "DP post-grasp replan steps cannot exceed the post-grasp ensemble window."
+                )
+            if (
+                self.temporal_ensemble_inference_deadline_ms is not None
+                and self.temporal_ensemble_inference_deadline_ms <= 0
+            ):
+                raise ValueError("`temporal_ensemble_inference_deadline_ms` must be positive.")
+            if self.temporal_ensemble_post_grasp_window is not None:
+                if self.temporal_ensemble_gripper_index < 0:
+                    raise ValueError("`temporal_ensemble_gripper_index` must be non-negative.")
+                if self.temporal_ensemble_min_open_excursion <= 0:
+                    raise ValueError("`temporal_ensemble_min_open_excursion` must be positive.")
+                if not (
+                    0
+                    < self.temporal_ensemble_close_fraction
+                    < self.temporal_ensemble_reopen_fraction
+                    < 1
+                ):
+                    raise ValueError(
+                        "Require 0 < temporal_ensemble_close_fraction < "
+                        "temporal_ensemble_reopen_fraction < 1."
+                    )
+                if self.temporal_ensemble_phase_stable_steps <= 0:
+                    raise ValueError("`temporal_ensemble_phase_stable_steps` must be positive.")
+                if self.temporal_ensemble_phase_stable_delta_fraction <= 0:
+                    raise ValueError(
+                        "`temporal_ensemble_phase_stable_delta_fraction` must be positive."
+                    )
 
         if self.resize_shape is not None and (
             len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)

@@ -141,17 +141,42 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             from .temporal_window import TemporalWindowDataset
 
             _cur_idx = getattr(cfg.trainable_config, "proprio_current_indices", None)
-            dataset = TemporalWindowDataset(dataset, K=int(_K), state_indices=_cur_idx)
+            # The window is consumed *after* the policy preprocessor.  Apply
+            # the same state normalization here so the temporal path sees the
+            # exact normalized current values as the direct state path.  This
+            # is particularly important for DP: it uses MIN_MAX, whereas ACT
+            # uses MEAN_STD.  The dataset view has already applied any thesis
+            # q99.5 current transform before these statistics are computed.
+            _norm_mapping = getattr(cfg.trainable_config, "normalization_mapping", {})
+            _norm_mode = _norm_mapping.get("STATE", "MEAN_STD")
+            # ``joint_cnn`` also exists for ACT, whose temporal encoder
+            # expects the legacy flat one-observation window.  DP is the only
+            # current consumer that needs one history for each n_obs_steps
+            # observation.
+            from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+
+            _obs_steps = (
+                int(cfg.trainable_config.n_obs_steps)
+                if _enc == "joint_cnn" and isinstance(cfg.trainable_config, DiffusionConfig)
+                else 1
+            )
+            dataset = TemporalWindowDataset(
+                dataset,
+                K=int(_K),
+                state_indices=_cur_idx,
+                normalization_mode=_norm_mode,
+                observation_steps=_obs_steps,
+            )
             logging.info(
                 f"Wrapped dataset with TemporalWindowDataset "
-                f"(K={_K}, enc={_enc}, n_current={len(_cur_idx) if _cur_idx is not None else 'all'})"
+                f"(K={_K}, enc={_enc}, n_current={len(_cur_idx) if _cur_idx is not None else 'all'}, "
+                f"normalization={getattr(_norm_mode, 'value', _norm_mode)}, observations={_obs_steps})"
             )
-        except Exception as e:  # pragma: no cover - surface, don't silently train on wrong obs
-            logging.warning(
-                f"TemporalWindowDataset wrap requested but failed ({e}); "
-                f"training will proceed WITHOUT the state_window -> temporal "
-                f"encoders that need it will crash on forward."
-            )
+        except Exception as e:  # pragma: no cover - depends on external dataset metadata
+            raise RuntimeError(
+                "TemporalWindowDataset wrapping was requested but failed; refusing to train "
+                "with a missing or incorrectly normalized current-history input."
+            ) from e
     # ============================================================================
 
     return dataset

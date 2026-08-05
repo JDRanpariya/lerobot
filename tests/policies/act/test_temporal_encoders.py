@@ -31,13 +31,14 @@ def test_explicit_encoder_persists_gravity_baseline():
     torch.testing.assert_close(restored.gravity_baseline, expected)
 
 
-def _joint_config():
+def _joint_config(pooling="mean"):
     return SimpleNamespace(
         proprio_current_indices=[6, 7, 8, 9, 10, 11],
         proprio_K=9,
         proprio_cnn_channels=[4, 4, 2],
         proprio_cnn_kernel_sizes=[3, 3, 3],
         proprio_cnn_dilations=[1, 2, 4],
+        proprio_cnn_pooling=pooling,
     )
 
 
@@ -86,6 +87,42 @@ def test_joint_cnn_keeps_histories_isolated_before_attention():
     torch.testing.assert_close(changed[:, [0, 1, 3, 4, 5]], baseline[:, [0, 1, 3, 4, 5]])
     assert not torch.equal(changed[:, 2], baseline[:, 2])
     assert encoder.embedding_tokens() == 6
+
+
+def test_joint_cnn_contact_pooling_preserves_mean_max_and_latest_per_joint():
+    encoder = JointCNNTemporalEncoder(
+        _joint_config(pooling="mean_max_latest"), state_dim=12
+    )
+    encoder.cnn = torch.nn.Identity()
+    encoder.out_dim = 1
+    encoder.pool_factor = 3
+
+    positions = torch.arange(6, dtype=torch.float32).unsqueeze(0)
+    histories = torch.zeros(1, 10, 6)
+    histories[0, 3, 2] = 4.0  # brief J3 contact peak
+    histories[0, -1, 4] = 2.0  # latest J5 evidence
+    output = encoder(
+        {
+            "observation.state": torch.cat((positions, torch.zeros_like(positions)), dim=-1),
+            "observation.state_window": histories.reshape(1, -1),
+        }
+    )
+
+    embedding = output["proprio_embedding"]
+    assert embedding.shape == (1, 6, 4)
+    torch.testing.assert_close(embedding[0, :, 0], positions[0])
+    torch.testing.assert_close(embedding[0, 2, 1:], torch.tensor([0.4, 4.0, 0.0]))
+    torch.testing.assert_close(embedding[0, 4, 1:], torch.tensor([0.2, 2.0, 2.0]))
+    torch.testing.assert_close(embedding[0, [0, 1, 3, 5], 1:], torch.zeros(4, 3))
+    assert encoder.embedding_dim() == 4
+
+
+def test_joint_cnn_missing_pooling_field_preserves_historical_shape():
+    legacy = _joint_config()
+    del legacy.proprio_cnn_pooling
+    encoder = JointCNNTemporalEncoder(legacy, state_dim=12)
+    assert encoder.pooling == "mean"
+    assert encoder.embedding_dim() == 3
 
 
 def test_diagnostics_derive_history_requirement_from_encoder_capability():

@@ -308,6 +308,16 @@ class ExplicitFeatureEncoder(BaseTemporalEncoder):
         return batch
 
 
+def _pool_temporal_features(features: Tensor, pooling: str) -> Tensor:
+    """Expose mean, peak-like, and latest learned temporal features."""
+    mean = features.mean(dim=-1)
+    if pooling == "mean":
+        return mean
+    if pooling == "mean_max_latest":
+        return torch.cat((mean, features.amax(dim=-1), features[..., -1]), dim=-1)
+    raise ValueError(f"Unknown temporal CNN pooling mode: {pooling!r}")
+
+
 class CNNTemporalEncoder(BaseTemporalEncoder):
     """T3: Learned 1D-CNN over current history for token/film/hybrid fusion.
 
@@ -336,6 +346,8 @@ class CNNTemporalEncoder(BaseTemporalEncoder):
         self.cnn = nn.Sequential(*layers)
         self.global_pool = nn.AdaptiveAvgPool1d(1)
         self.out_dim = channels[-1]
+        self.pooling = getattr(config, "proprio_cnn_pooling", "mean")
+        self.pool_factor = 1 if self.pooling == "mean" else 3
 
     def output_state_dim(self) -> int:
         return self.state_dim
@@ -347,7 +359,7 @@ class CNNTemporalEncoder(BaseTemporalEncoder):
         return True
 
     def embedding_dim(self) -> int:
-        return self.out_dim
+        return self.out_dim * self.pool_factor
 
     def forward(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
         window = self._get_state_window(batch)
@@ -366,7 +378,11 @@ class CNNTemporalEncoder(BaseTemporalEncoder):
         # window: (B, (K+1)*n_current) -> (B, n_current, K+1)
         current_history = window.view(B, self.K + 1, self.n_current).transpose(1, 2)
         features = self.cnn(current_history)  # (B, channels[-1], L)
-        embedding = self.global_pool(features).squeeze(-1)  # (B, channels[-1])
+        embedding = (
+            self.global_pool(features).squeeze(-1)
+            if self.pooling == "mean"
+            else _pool_temporal_features(features, self.pooling)
+        )
 
         batch = dict(batch)
         batch["proprio_embedding"] = embedding
@@ -451,6 +467,8 @@ class JointCNNTemporalEncoder(BaseTemporalEncoder):
         self.cnn = nn.Sequential(*layers)
         self.global_pool = nn.AdaptiveAvgPool1d(1)
         self.out_dim = channels[-1]
+        self.pooling = getattr(config, "proprio_cnn_pooling", "mean")
+        self.pool_factor = 1 if self.pooling == "mean" else 3
 
     def output_state_dim(self) -> int:
         return self.n_position
@@ -462,7 +480,7 @@ class JointCNNTemporalEncoder(BaseTemporalEncoder):
         return True
 
     def embedding_dim(self) -> int:
-        return self.out_dim + 1
+        return self.out_dim * self.pool_factor + 1
 
     def embedding_tokens(self) -> int:
         return self.n_current
@@ -487,8 +505,12 @@ class JointCNNTemporalEncoder(BaseTemporalEncoder):
         histories = window.view(batch_size, self.K + 1, self.n_current)
         histories = histories.transpose(1, 2).reshape(batch_size * self.n_current, 1, self.K + 1)
         features = self.cnn(histories)
-        summaries = self.global_pool(features).squeeze(-1)
-        summaries = summaries.view(batch_size, self.n_current, self.out_dim)
+        summaries = (
+            self.global_pool(features).squeeze(-1)
+            if self.pooling == "mean"
+            else _pool_temporal_features(features, self.pooling)
+        )
+        summaries = summaries.view(batch_size, self.n_current, self.out_dim * self.pool_factor)
 
         batch["observation.state"] = positions
         batch["proprio_embedding"] = torch.cat((positions.unsqueeze(-1), summaries), dim=-1)

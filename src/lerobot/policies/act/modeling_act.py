@@ -36,6 +36,7 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 from ..pretrained import PreTrainedPolicy
+from ..phase_adaptive import GripperCyclePhaseDetector
 from .configuration_act import ACTConfig
 from .fusion_modules import build_fusion_module
 from .temporal_encoders import build_temporal_encoder
@@ -72,6 +73,18 @@ class ACTPolicy(PreTrainedPolicy):
                 config.chunk_size,
                 temporal_ensemble_window=config.temporal_ensemble_window,
             )
+            self.temporal_ensemble_phase_detector = (
+                GripperCyclePhaseDetector(
+                    gripper_index=config.temporal_ensemble_gripper_index,
+                    min_open_excursion=config.temporal_ensemble_min_open_excursion,
+                    close_fraction=config.temporal_ensemble_close_fraction,
+                    reopen_fraction=config.temporal_ensemble_reopen_fraction,
+                    stable_steps=config.temporal_ensemble_phase_stable_steps,
+                    stable_delta_fraction=config.temporal_ensemble_phase_stable_delta_fraction,
+                )
+                if config.temporal_ensemble_post_grasp_window is not None
+                else None
+            )
 
         self.reset()
 
@@ -100,6 +113,8 @@ class ACTPolicy(PreTrainedPolicy):
         """This should be called whenever the environment is reset."""
         if self.config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler.reset()
+            if self.temporal_ensemble_phase_detector is not None:
+                self.temporal_ensemble_phase_detector.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
@@ -142,6 +157,15 @@ class ACTPolicy(PreTrainedPolicy):
         # ======================================================================
 
         if self.config.temporal_ensemble_coeff is not None:
+            if self.temporal_ensemble_phase_detector is not None:
+                phase = self.temporal_ensemble_phase_detector.update(batch[OBS_STATE])
+                if phase.changed:
+                    window = (
+                        self.config.temporal_ensemble_post_grasp_window
+                        if phase.post_grasp
+                        else self.config.temporal_ensemble_window
+                    )
+                    self.temporal_ensembler.set_window(window)
             actions = self.predict_action_chunk(batch)
             action = self.temporal_ensembler.update(actions)
             return action
@@ -257,9 +281,20 @@ class ACTTemporalEnsembler:
                 f"{temporal_ensemble_window} for chunk_size={chunk_size}."
             )
         self.chunk_size = chunk_size
+        self.temporal_ensemble_coeff = temporal_ensemble_coeff
         self.temporal_ensemble_window = temporal_ensemble_window
         self.ensemble_weights = torch.exp(-temporal_ensemble_coeff * torch.arange(chunk_size))
         self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0)
+        self.reset()
+
+    def set_window(self, temporal_ensemble_window: int | None) -> None:
+        """Switch ensemble history policy and discard predictions from the old phase."""
+        if temporal_ensemble_window is not None and not 1 <= temporal_ensemble_window <= self.chunk_size:
+            raise ValueError(
+                "temporal_ensemble_window must be between 1 and chunk_size; got "
+                f"{temporal_ensemble_window} for chunk_size={self.chunk_size}."
+            )
+        self.temporal_ensemble_window = temporal_ensemble_window
         self.reset()
 
     def reset(self):
@@ -307,8 +342,12 @@ class ACTTemporalEnsembler:
         if self.temporal_ensemble_window is not None:
             return self._update_recent_window(actions)
 
-        self.ensemble_weights = self.ensemble_weights.to(device=actions.device)
-        self.ensemble_weights_cumsum = self.ensemble_weights_cumsum.to(device=actions.device)
+        self.ensemble_weights = self.ensemble_weights.to(
+            device=actions.device, dtype=actions.dtype
+        )
+        self.ensemble_weights_cumsum = self.ensemble_weights_cumsum.to(
+            device=actions.device, dtype=actions.dtype
+        )
         if self.ensembled_actions is None:
             # Initializes `self._ensembled_action` to the sequence of actions predicted during the first
             # time step of the episode.

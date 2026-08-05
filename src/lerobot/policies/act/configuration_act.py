@@ -125,6 +125,16 @@ class ACTConfig(PreTrainedConfig):
     # predictions older than this many control steps while still re-planning
     # every step and blending the retained predictions.
     temporal_ensemble_window: int | None = None
+    # Optional phase-adaptive deployment: keep the ordinary ensemble before a
+    # completed grasp, then reset it and use this window after the gripper's
+    # causal open-close cycle is detected.
+    temporal_ensemble_post_grasp_window: int | None = None
+    temporal_ensemble_gripper_index: int = 5
+    temporal_ensemble_min_open_excursion: float = 0.25
+    temporal_ensemble_close_fraction: float = 0.5
+    temporal_ensemble_reopen_fraction: float = 0.8
+    temporal_ensemble_phase_stable_steps: int = 15
+    temporal_ensemble_phase_stable_delta_fraction: float = 0.02
 
     # Training and loss computation.
     dropout: float = 0.1
@@ -154,6 +164,9 @@ class ACTConfig(PreTrainedConfig):
     proprio_cnn_channels: list[int] = field(default_factory=lambda: [16, 16, 8])
     proprio_cnn_kernel_sizes: list[int] = field(default_factory=lambda: [3, 3, 3])
     proprio_cnn_dilations: list[int] = field(default_factory=lambda: [1, 2, 4])
+    # `mean` preserves historical checkpoint shapes. `mean_max_latest` is the
+    # contact-sensitive feature pooling used only by newly trained presets.
+    proprio_cnn_pooling: str = "mean"
 
     # === FUSION STAGE ===
     # Where: at what architectural depth temporal features fuse with vision
@@ -253,6 +266,11 @@ class ACTConfig(PreTrainedConfig):
             )
         if caps["history"] and self.proprio_K <= 0:
             raise ValueError(f"Temporal encoder '{self.proprio_temporal_encoder}' requires proprio_K > 0.")
+        if self.proprio_cnn_pooling not in {"mean", "mean_max_latest"}:
+            raise ValueError(
+                "`proprio_cnn_pooling` must be 'mean' or 'mean_max_latest'. Got "
+                f"{self.proprio_cnn_pooling!r}."
+            )
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
@@ -272,6 +290,36 @@ class ACTConfig(PreTrainedConfig):
                 raise ValueError(
                     "`temporal_ensemble_window` must be between 1 and `chunk_size`. Got "
                     f"{self.temporal_ensemble_window} for a chunk size of {self.chunk_size}."
+                )
+        if self.temporal_ensemble_post_grasp_window is not None:
+            if self.temporal_ensemble_coeff is None:
+                raise ValueError(
+                    "`temporal_ensemble_post_grasp_window` requires `temporal_ensemble_coeff`."
+                )
+            if not 1 <= self.temporal_ensemble_post_grasp_window <= self.chunk_size:
+                raise ValueError(
+                    "`temporal_ensemble_post_grasp_window` must be between 1 and `chunk_size`. Got "
+                    f"{self.temporal_ensemble_post_grasp_window} for chunk_size={self.chunk_size}."
+                )
+            if self.temporal_ensemble_gripper_index < 0:
+                raise ValueError("`temporal_ensemble_gripper_index` must be non-negative.")
+            if self.temporal_ensemble_min_open_excursion <= 0:
+                raise ValueError("`temporal_ensemble_min_open_excursion` must be positive.")
+            if not (
+                0
+                < self.temporal_ensemble_close_fraction
+                < self.temporal_ensemble_reopen_fraction
+                < 1
+            ):
+                raise ValueError(
+                    "Require 0 < temporal_ensemble_close_fraction < "
+                    "temporal_ensemble_reopen_fraction < 1."
+                )
+            if self.temporal_ensemble_phase_stable_steps <= 0:
+                raise ValueError("`temporal_ensemble_phase_stable_steps` must be positive.")
+            if self.temporal_ensemble_phase_stable_delta_fraction <= 0:
+                raise ValueError(
+                    "`temporal_ensemble_phase_stable_delta_fraction` must be positive."
                 )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
