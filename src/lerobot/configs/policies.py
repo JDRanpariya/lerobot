@@ -16,7 +16,7 @@ import builtins
 import json
 import os
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from logging import getLogger
 from pathlib import Path
 from typing import Any, TypeVar
@@ -203,18 +203,28 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
+        if config_file is None:
+            raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
+
+        with open(config_file) as f:
+            config = json.load(f)
+
+        # A checkpoint persists every config field that existed when it was trained.
+        # Removing a field from the config dataclass would otherwise make every older
+        # checkpoint permanently unloadable, so drop unknown keys (loudly) instead of
+        # letting draccus reject the whole file.
+        config = cls._drop_unknown_fields(config, model_id)
+
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
+            json.dump(config, f)
+            config_file = f.name
+
         # HACK: Parse the original config to get the config subclass, so that we can
         # apply cli overrides.
         # This is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)
         with draccus.config_type("json"):
             orig_config = draccus.parse(cls, config_file, args=[])
-
-        if config_file is None:
-            raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
-
-        with open(config_file) as f:
-            config = json.load(f)
 
         config.pop("type")
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
@@ -224,3 +234,41 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
             return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+
+    @classmethod
+    def _drop_unknown_fields(cls, config: dict[str, Any], model_id: str) -> dict[str, Any]:
+        """Drop persisted config keys that the current config class no longer defines.
+
+        A checkpoint's ``config.json`` records every field the config dataclass had at
+        training time. When a field is later deleted from that dataclass, draccus
+        rejects the entire file and the checkpoint becomes unloadable -- silently
+        bricking every checkpoint trained before the cleanup. Dropping unknown keys
+        with a warning keeps old checkpoints readable across config changes.
+
+        This only ever discards persisted values; it never invents them. A removed
+        field falls back to the current dataclass default, so a checkpoint cannot
+        silently acquire behaviour it was not trained or evaluated with. Keys are
+        matched against the concrete subclass named by ``type``; if that cannot be
+        resolved the config is returned untouched so draccus reports its own error.
+        """
+        policy_type = config.get("type")
+        if not policy_type:
+            return config
+        try:
+            subclass = cls.get_choice_class(policy_type)
+        except Exception:  # unknown/unregistered type -- let draccus report it
+            return config
+
+        known = {f.name for f in fields(subclass)} | {"type"}
+        unknown = sorted(set(config) - known)
+        if unknown:
+            logger.warning(
+                "%s: ignoring %d persisted config field(s) that %s no longer defines: %s. "
+                "This is expected when loading a checkpoint trained before those fields were "
+                "removed; the persisted values are discarded and current defaults apply.",
+                model_id,
+                len(unknown),
+                subclass.__name__,
+                ", ".join(unknown),
+            )
+        return {key: value for key, value in config.items() if key in known}
