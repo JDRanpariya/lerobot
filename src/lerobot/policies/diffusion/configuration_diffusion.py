@@ -46,6 +46,9 @@ class DiffusionConfig(PreTrainedConfig):
         horizon: Diffusion model action prediction size as detailed in `DiffusionPolicy.select_action`.
         n_action_steps: The number of action steps to run in the environment for one invocation of the policy.
             See `DiffusionPolicy.select_action` for more details.
+        frame_stride: Spacing, in source-dataset frames, between consecutive observations and actions.
+            For example, a stride of 3 trains a 10 Hz policy from a 30 Hz dataset. Deployment must use
+            the corresponding lower control frequency; this field does not rescale actions by itself.
         input_features: A dictionary defining the PolicyFeature of the input data for the policy. The key represents
             the input data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
         output_features: A dictionary defining the PolicyFeature of the output data for the policy. The key represents
@@ -102,6 +105,7 @@ class DiffusionConfig(PreTrainedConfig):
     n_obs_steps: int = 2
     horizon: int = 16
     n_action_steps: int = 8
+    frame_stride: int = 1
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -180,8 +184,27 @@ class DiffusionConfig(PreTrainedConfig):
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
 
+    # Optional training-time exponential moving average. The online and EMA
+    # models are both persisted in one checkpoint so the comparison shares an
+    # identical optimizer trajectory and is exactly resumable.
+    use_ema: bool = False
+    ema_use_for_inference: bool = False
+    ema_inv_gamma: float = 1.0
+    ema_power: float = 0.75
+    ema_min_decay: float = 0.0
+    ema_max_decay: float = 0.9999
+    ema_update_after_step: int = 0
+
     def __post_init__(self):
         super().__post_init__()
+
+        if self.frame_stride <= 0:
+            raise ValueError(f"`frame_stride` must be positive. Got {self.frame_stride}.")
+        # Preserve LeRobot's original padding policy while expressing it in
+        # source-dataset frames. This matches the strided delta indices below.
+        self.drop_n_last_frames = (
+            self.horizon - self.n_action_steps - self.n_obs_steps + 1
+        ) * self.frame_stride
 
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
@@ -226,6 +249,19 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 "`proprio_cnn_pooling` must be 'mean' or 'mean_max_latest'."
             )
+
+        if self.ema_use_for_inference and not self.use_ema:
+            raise ValueError("`ema_use_for_inference` requires `use_ema=True`.")
+        if self.ema_inv_gamma <= 0:
+            raise ValueError("`ema_inv_gamma` must be positive.")
+        if self.ema_power <= 0:
+            raise ValueError("`ema_power` must be positive.")
+        if not 0 <= self.ema_min_decay <= self.ema_max_decay < 1:
+            raise ValueError(
+                "EMA decay bounds must satisfy 0 <= ema_min_decay <= ema_max_decay < 1."
+            )
+        if self.ema_update_after_step < 0:
+            raise ValueError("`ema_update_after_step` must be non-negative.")
 
         if self.temporal_ensemble_coeff is None:
             temporal_options = (
@@ -312,11 +348,17 @@ class DiffusionConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
-        return list(range(1 - self.n_obs_steps, 1))
+        return [
+            index * self.frame_stride
+            for index in range(1 - self.n_obs_steps, 1)
+        ]
 
     @property
     def action_delta_indices(self) -> list:
-        return list(range(1 - self.n_obs_steps, 1 - self.n_obs_steps + self.horizon))
+        return [
+            index * self.frame_stride
+            for index in range(1 - self.n_obs_steps, 1 - self.n_obs_steps + self.horizon)
+        ]
 
     @property
     def reward_delta_indices(self) -> None:

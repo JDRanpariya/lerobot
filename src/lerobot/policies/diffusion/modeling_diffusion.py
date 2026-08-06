@@ -22,6 +22,7 @@ TODO(alexander-soare):
 
 import math
 import time
+from copy import deepcopy
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -84,6 +85,14 @@ class DiffusionPolicy(PreTrainedPolicy):
         self._queues = None
 
         self.diffusion = DiffusionModel(config)
+        self.ema_diffusion = None
+        if self.config.use_ema:
+            # A registered frozen module makes both weight sets part of the
+            # ordinary safetensors checkpoint. It therefore survives resume
+            # without a parallel, easy-to-misplace training-state file.
+            self.ema_diffusion = deepcopy(self.diffusion)
+            self.ema_diffusion.requires_grad_(False)
+            self.register_buffer("ema_optimization_step", torch.zeros((), dtype=torch.long))
 
         self.temporal_ensembler = None
         if self.config.temporal_ensemble_coeff is not None:
@@ -96,6 +105,42 @@ class DiffusionPolicy(PreTrainedPolicy):
 
     def get_optim_params(self) -> dict:
         return self.diffusion.parameters()
+
+    def _ema_decay(self) -> float:
+        """Return the original Diffusion Policy warm-up decay for the next update."""
+        optimization_step = int(self.ema_optimization_step.item())
+        step = max(0, optimization_step - self.config.ema_update_after_step - 1)
+        if step <= 0:
+            return 0.0
+        decay = 1.0 - (1.0 + step / self.config.ema_inv_gamma) ** (-self.config.ema_power)
+        return min(max(decay, self.config.ema_min_decay), self.config.ema_max_decay)
+
+    @torch.no_grad()
+    def update(self) -> None:
+        """Update EMA after an optimizer step; called by the LeRobot trainer hook."""
+        if self.ema_diffusion is None:
+            return
+        self.ema_optimization_step.add_(1)
+        decay = self._ema_decay()
+        one_minus_decay = 1.0 - decay
+        for ema_parameter, online_parameter in zip(
+            self.ema_diffusion.parameters(), self.diffusion.parameters(), strict=True
+        ):
+            ema_parameter.sub_(one_minus_decay * (ema_parameter - online_parameter.detach()))
+        # GroupNorm has no running statistics, but copying buffers keeps this
+        # correct if a future checkpoint enables a BatchNorm backbone.
+        for ema_buffer, online_buffer in zip(
+            self.ema_diffusion.buffers(), self.diffusion.buffers(), strict=True
+        ):
+            ema_buffer.copy_(online_buffer)
+
+    @property
+    def inference_model(self) -> "DiffusionModel":
+        if self.config.ema_use_for_inference:
+            if self.ema_diffusion is None:
+                raise RuntimeError("EMA inference requested, but this checkpoint has no EMA model.")
+            return self.ema_diffusion
+        return self.diffusion
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
@@ -146,7 +191,7 @@ class DiffusionPolicy(PreTrainedPolicy):
             if self._current_history_window is None:
                 raise RuntimeError("joint_cnn history was not populated before DP chunk prediction.")
             batch["observation.state_window"] = self._current_history_window
-        actions = self.diffusion.generate_actions(batch, noise=noise)
+        actions = self.inference_model.generate_actions(batch, noise=noise)
 
         return actions
 
