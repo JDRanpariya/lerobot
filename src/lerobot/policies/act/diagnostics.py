@@ -234,7 +234,31 @@ class ModalityDiagnostics:
         """
         if self.is_diffusion:
             gen = torch.Generator(device=self.device).manual_seed(self._dp_seed)
-            return self.policy.diffusion.generate_actions(batch, generator=gen)
+            # inference_model honours config.ema_use_for_inference. Reaching for
+            # policy.diffusion directly would always evaluate the raw weights and
+            # silently ignore an EMA request, reporting EMA and non-EMA as identical.
+            model = (
+                self.policy.inference_model
+                if hasattr(self.policy, "inference_model")
+                else self.policy.diffusion
+            )
+            return model.generate_actions(batch, generator=gen)
+        # Policies that sample without accepting a generator (e.g. multi_task_dit
+        # flow matching calls torch.randn directly) would otherwise draw different
+        # noise for the full and ablated passes, so the measured difference would
+        # include sampling variance. Reseeding the global RNG before every call makes
+        # the pair noise-matched. Deterministic policies such as ACT are unaffected.
+        torch.manual_seed(self._dp_seed)
+        if str(self.device).startswith("cuda"):
+            torch.cuda.manual_seed_all(self._dp_seed)
+        # Some policies' predict_action_chunk re-reads their internal observation
+        # queues, which are empty outside a rollout loop (multi_task_dit raises
+        # "stack expects a non-empty TensorList"). Where a direct generation entry
+        # point exists, call it with the already-stacked batch instead -- the same
+        # approach the diffusion branch above takes with generate_actions.
+        generate = getattr(self.policy, "_generate_actions", None)
+        if generate is not None:
+            return generate(batch)
         return self.policy.predict_action_chunk(batch)
 
     def _state_impute_vector(self, state_dim: int, device, dtype) -> Optional[Tensor]:
