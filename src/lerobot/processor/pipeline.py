@@ -48,6 +48,7 @@ from safetensors.torch import load_file, save_file
 from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.types import EnvAction, EnvTransition, PolicyAction, RobotAction, RobotObservation, TransitionKey
 from lerobot.utils.constants import HF_LEROBOT_HOME
+from lerobot.utils.asset_paths import relocate_mapping
 from lerobot.utils.hub import HubMixin
 
 from .converters import batch_to_transition, create_transition, transition_to_batch
@@ -567,6 +568,13 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
 
         # 2. Validate configuration and handle migration
         cls._validate_loaded_config(model_id, loaded_config, config_filename)
+
+        # 2b. A pipeline saved on another machine can embed absolute asset paths
+        # (e.g. a tokenizer directory under /data/...). Relocate unreachable ones
+        # onto local copies so the pipeline can be rebuilt here; nothing is written.
+        for _step in loaded_config.get("steps", []):
+            if isinstance(_step.get("config"), dict):
+                _step["config"] = relocate_mapping(_step["config"])
 
         # 3. Build steps with overrides
         steps, validated_overrides = cls._build_steps_with_overrides(

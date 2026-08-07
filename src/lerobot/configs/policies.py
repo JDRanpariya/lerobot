@@ -29,6 +29,7 @@ from huggingface_hub.errors import HfHubHTTPError
 from lerobot.optim import LRSchedulerConfig, OptimizerConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.device_utils import auto_select_torch_device, is_amp_available, is_torch_device_available
+from lerobot.utils.asset_paths import relocate_mapping
 from lerobot.utils.hub import HubMixin
 
 from .types import FeatureType, PolicyFeature
@@ -214,6 +215,9 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         # checkpoint permanently unloadable, so drop unknown keys (loudly) instead of
         # letting draccus reject the whole file.
         config = cls._drop_unknown_fields(config, model_id)
+        # Encoder paths recorded on another machine (e.g. a cluster) are relocated
+        # onto local copies when unreachable; see lerobot.utils.asset_paths.
+        config = relocate_mapping(config, key_suffixes=("_encoder_name",))
 
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)
