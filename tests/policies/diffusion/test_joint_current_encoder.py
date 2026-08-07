@@ -108,7 +108,7 @@ def test_dp_online_history_matches_two_observation_contract():
 class _TinyBaseDataset:
     def __init__(self):
         self.rows = []
-        for frame in range(3):
+        for frame in range(7):
             state = torch.zeros(12)
             state[6:] = frame + 1
             self.rows.append(
@@ -119,7 +119,7 @@ class _TinyBaseDataset:
                 }
             )
         self.hf_dataset = self.rows
-        self.episode_data_index = {"from_index": torch.tensor([0]), "to_index": torch.tensor([3])}
+        self.episode_data_index = {"from_index": torch.tensor([0]), "to_index": torch.tensor([7])}
         self.meta = SimpleNamespace(
             stats={"observation.state": {"min": torch.zeros(12), "max": torch.full((12,), 4.0)}}
         )
@@ -145,3 +145,20 @@ def test_dp_dataset_windows_are_per_observation_and_minmax_normalized():
     torch.testing.assert_close(window[0, :, 0], torch.tensor([-0.5, 0.0]))
     # For observation t: [2, 3] -> [0, .5].
     torch.testing.assert_close(window[1, :, 0], torch.tensor([0.0, 0.5]))
+
+
+def test_dp_dataset_windows_follow_recovery_frame_stride():
+    dataset = TemporalWindowDataset(
+        _TinyBaseDataset(),
+        K=1,
+        state_indices=[6, 7, 8, 9, 10, 11],
+        normalize_window=False,
+        observation_steps=2,
+        frame_stride=3,
+    )
+    window = dataset[6]["observation.state_window"]
+    assert window.shape == (2, 2, 6)
+    # Observation centres are source frames 3 and 6. Each K=1 history sample
+    # is also three source frames apart, matching 10 Hz deployment.
+    torch.testing.assert_close(window[0, :, 0], torch.tensor([1.0, 4.0]))
+    torch.testing.assert_close(window[1, :, 0], torch.tensor([4.0, 7.0]))

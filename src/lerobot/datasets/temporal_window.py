@@ -58,6 +58,7 @@ class TemporalWindowDataset(Dataset):
         normalize_eps: float = 1e-8,
         normalization_mode: str = "MEAN_STD",
         observation_steps: int = 1,
+        frame_stride: int = 1,
     ):
         self.base = base_dataset
         self.K = K
@@ -70,8 +71,11 @@ class TemporalWindowDataset(Dataset):
         self.normalize_eps = normalize_eps
         self.normalization_mode = getattr(normalization_mode, "value", normalization_mode)
         self.observation_steps = observation_steps
+        self.frame_stride = frame_stride
         if self.observation_steps <= 0:
             raise ValueError("observation_steps must be positive")
+        if self.frame_stride <= 0:
+            raise ValueError("frame_stride must be positive")
 
         self._window_mean = None
         self._window_std = None
@@ -180,7 +184,13 @@ class TemporalWindowDataset(Dataset):
         for observation_offset in range(1 - self.observation_steps, 1):
             window_list = []
             for k in range(self.K, -1, -1):  # K, K-1, ..., 0
-                past_frame_in_ep = frame_in_ep + observation_offset - k
+                # Match the policy's observation/action timebase. A recovery
+                # policy with frame_stride=3 is deployed at 10 Hz on a 30 Hz
+                # source dataset, so both its observation centres and every
+                # sample in its current-history window must be three source
+                # frames apart. Consecutive source frames here would train on
+                # a 30 Hz history but deploy on a 10 Hz history.
+                past_frame_in_ep = frame_in_ep + (observation_offset - k) * self.frame_stride
                 is_pad = False
                 if past_frame_in_ep < 0:
                     past_state = torch.zeros_like(state)

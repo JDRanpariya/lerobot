@@ -341,15 +341,33 @@ class ModalityDiagnostics:
                 else:
                     s[..., idx] = s[..., idx].mean(dim=0, keepdim=True)
                 b["observation.state"] = s
-            # observation.state_window is ACT-only (temporal encoders); DP has no window.
-            # Each K-step block holds the same current channels in the same normalized
-            # space, so impute each block with the same current-channel values.
-            if not self.is_diffusion and "observation.state_window" in b:
+            # Temporal encoders can carry all usable current outside the direct state.
+            # ACT stores a flattened [(K+1)*J] window; DP joint_cnn stores
+            # [n_obs,K+1,J]. Ablating only observation.state would therefore be a
+            # false no-op for DP joint_cnn, whose model deliberately discards raw
+            # current from the direct state condition.
+            if which == "current" and "observation.state_window" in b:
                 w = b["observation.state_window"].clone()
                 n_cur = len(self.current_indices)
-                kp1 = w.shape[-1] // n_cur
-                if which == "current":
-                    cur_impute = None if impute is None else impute[self.current_indices]
+                cur_impute = None if impute is None else impute[self.current_indices]
+                if self.is_diffusion:
+                    if w.shape[-1] != n_cur:
+                        raise ValueError(
+                            "DP current-history ablation expected the final window "
+                            f"dimension to contain {n_cur} joints, got {tuple(w.shape)}."
+                        )
+                    if cur_impute is not None:
+                        w[...] = cur_impute
+                    else:
+                        reduce_dims = tuple(range(w.ndim - 1))
+                        w[...] = w.mean(dim=reduce_dims, keepdim=True)
+                else:
+                    if w.shape[-1] % n_cur:
+                        raise ValueError(
+                            "ACT current-history ablation expected flattened K-step "
+                            f"joint blocks, got {tuple(w.shape)} for {n_cur} joints."
+                        )
+                    kp1 = w.shape[-1] // n_cur
                     for k in range(kp1):
                         sl = slice(k * n_cur, (k + 1) * n_cur)
                         if cur_impute is not None:

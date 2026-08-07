@@ -160,17 +160,24 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 if _enc == "joint_cnn" and isinstance(cfg.trainable_config, DiffusionConfig)
                 else 1
             )
+            _frame_stride = (
+                int(cfg.trainable_config.frame_stride)
+                if isinstance(cfg.trainable_config, DiffusionConfig)
+                else 1
+            )
             dataset = TemporalWindowDataset(
                 dataset,
                 K=int(_K),
                 state_indices=_cur_idx,
                 normalization_mode=_norm_mode,
                 observation_steps=_obs_steps,
+                frame_stride=_frame_stride,
             )
             logging.info(
                 f"Wrapped dataset with TemporalWindowDataset "
                 f"(K={_K}, enc={_enc}, n_current={len(_cur_idx) if _cur_idx is not None else 'all'}, "
-                f"normalization={getattr(_norm_mode, 'value', _norm_mode)}, observations={_obs_steps})"
+                f"normalization={getattr(_norm_mode, 'value', _norm_mode)}, observations={_obs_steps}, "
+                f"frame_stride={_frame_stride})"
             )
         except Exception as e:  # pragma: no cover - depends on external dataset metadata
             raise RuntimeError(
